@@ -19,6 +19,18 @@ cmake --build --preset vcpkg
 If your vcpkg checkout lives elsewhere, pass
 `-DCMAKE_TOOLCHAIN_FILE=/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake`.
 
+## Releases
+
+GitHub Actions builds release archives for Linux x64 and macOS arm64 when a
+version tag is pushed:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The workflow publishes a GitHub Release with packaged `opcua-cli` binaries.
+
 ## Commands
 
 ```sh
