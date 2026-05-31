@@ -1,0 +1,12 @@
+{
+  "name": "opcua-cli-cpp",
+  "version-string": "0.1.0",
+  "dependencies": [
+    {
+      "name": "pkgconf",
+      "host": true
+    },
+    "boost-json",
+    "open62541pp"
+  ]
+}
