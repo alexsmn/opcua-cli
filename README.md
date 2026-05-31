@@ -16,13 +16,20 @@ cmake --preset vcpkg
 cmake --build --preset vcpkg
 ```
 
+On Windows with Visual Studio 2022 and a sibling vcpkg checkout:
+
+```sh
+cmake --preset vcpkg-windows
+cmake --build --preset vcpkg-windows --config Debug
+```
+
 If your vcpkg checkout lives elsewhere, pass
 `-DCMAKE_TOOLCHAIN_FILE=/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake`.
 
 ## Releases
 
-GitHub Actions builds release archives for Linux x64 and macOS arm64 when a
-version tag is pushed:
+GitHub Actions builds release archives for Linux x64, macOS arm64, and
+Windows x64 when a version tag is pushed:
 
 ```sh
 git tag v0.1.0
