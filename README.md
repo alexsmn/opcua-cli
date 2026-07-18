@@ -74,6 +74,17 @@ Certificate loading and advanced security policy selection are represented in th
 CLI contract and validated, but require an `open62541pp`/`open62541` build with
 encryption plugins enabled.
 
+## Output conventions
+
+- stdout carries only command output (including `--json`); client logs go to
+  stderr and show warnings and errors only. `--debug` enables full logging
+  (on stdout, or stderr with `--debug-stderr`, or a file with
+  `--debug-file=PATH`).
+- `write` exits with code 1 when the server answers with a Bad status, so
+  scripts can detect rejected writes without parsing output.
+- Status codes missing from open62541's name table (vendor-specific server
+  codes) are reported by severity, e.g. `Bad (vendor-specific) (0x80300000)`.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

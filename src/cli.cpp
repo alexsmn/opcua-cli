@@ -294,16 +294,21 @@ int main(int argc, char** argv) {
                   << "Type:    " << result.type << "\n"
                   << "Status:  " << result.status << "\n";
       }
+      if (result.bad) {
+        return 1;
+      }
     } else if (args.command == "watch") {
       RequirePositionals(args, 2);
       auto interval = static_cast<std::uint64_t>(
           std::stoull(GetOption(args, "interval", "1000")));
       while (true) {
         auto result = client.Read(args.positionals[1], "Value");
+        // Flush per tick: with stdout on a pipe the stream is block-buffered,
+        // and an endless watch would otherwise show nothing for minutes.
         if (args.json) {
-          std::cout << boost::json::serialize(ReadToJson(result)) << "\n";
+          std::cout << boost::json::serialize(ReadToJson(result)) << std::endl;
         } else {
-          std::cout << result.value << "\n";
+          std::cout << result.value << std::endl;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(interval));
       }

@@ -43,6 +43,9 @@ struct WriteResult {
   std::string value;
   std::string type;
   std::string status;
+  // True when the server answered with a Bad status; the CLI exits nonzero so
+  // scripts can detect a rejected write without parsing the status text.
+  bool bad = false;
 };
 
 struct EndpointInfo {

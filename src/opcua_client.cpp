@@ -22,7 +22,16 @@ std::string ToString(const opcua::String& value) {
 std::string StatusToString(opcua::StatusCode status_code) {
   char buffer[32];
   std::snprintf(buffer, sizeof(buffer), "0x%08X", status_code.get());
-  return ToString(status_code.name()) + " (" + buffer + ")";
+  std::string name = ToString(status_code.name());
+  if (name == "Unknown StatusCode") {
+    // Codes outside open62541's table (e.g. vendor-specific server codes):
+    // classify by the severity bits, OPC UA Part 4 §7.38,
+    // https://reference.opcfoundation.org/Core/Part4/v105/docs/7.38
+    name = status_code.isBad()         ? "Bad (vendor-specific)"
+           : status_code.isUncertain() ? "Uncertain (vendor-specific)"
+                                       : "Good (vendor-specific)";
+  }
+  return name + " (" + buffer + ")";
 }
 
 std::string NodeClassName(opcua::NodeClass node_class) {
@@ -237,6 +246,50 @@ opcua::Variant MakeVariant(const std::string& value, const std::string& type) {
   throw std::runtime_error("Unsupported write type: " + type);
 }
 
+const char* LogLevelName(opcua::LogLevel level) {
+  switch (level) {
+    case opcua::LogLevel::Trace:
+      return "trace";
+    case opcua::LogLevel::Debug:
+      return "debug";
+    case opcua::LogLevel::Info:
+      return "info";
+    case opcua::LogLevel::Warning:
+      return "warn";
+    case opcua::LogLevel::Error:
+      return "error";
+    case opcua::LogLevel::Fatal:
+      return "fatal";
+  }
+  return "log";
+}
+
+// Builds the client log function honoring the --debug/--debug-stderr/
+// --debug-file options. stdout is reserved for command output (including
+// machine-readable --json), so logs never go there unless --debug explicitly
+// asks for full logging on stdout; without --debug only warnings and worse
+// are shown, on stderr. `file` outlives the returned function (owned by
+// OpcuaClient::Impl).
+opcua::LogFunction MakeLogFunction(const SecurityOptions& options,
+                                   std::FILE* file) {
+  std::FILE* destination = file != nullptr        ? file
+                           : options.debug_stderr ? stderr
+                           : options.debug        ? stdout
+                                                  : stderr;
+  const opcua::LogLevel min_level =
+      options.debug ? opcua::LogLevel::Debug : opcua::LogLevel::Warning;
+  return [destination, min_level](opcua::LogLevel level,
+                                  opcua::LogCategory /*category*/,
+                                  std::string_view message) {
+    if (level < min_level) {
+      return;
+    }
+    std::fprintf(destination, "[%s] %.*s\n", LogLevelName(level),
+                 static_cast<int>(message.size()), message.data());
+    std::fflush(destination);
+  };
+}
+
 std::vector<BrowseEntry> BrowseNode(opcua::Client& client,
                                     const opcua::NodeId& node_id,
                                     bool recursive,
@@ -275,7 +328,15 @@ std::vector<BrowseEntry> BrowseNode(opcua::Client& client,
 
 struct OpcuaClient::Impl {
   explicit Impl(SecurityOptions opts) : options(std::move(opts)) {
+    if (!options.debug_file.empty()) {
+      log_file.reset(std::fopen(options.debug_file.c_str(), "a"));
+      if (log_file == nullptr) {
+        throw std::runtime_error("Cannot open debug file: " +
+                                 options.debug_file);
+      }
+    }
     opcua::ClientConfig config;
+    config.setLogger(MakeLogFunction(options, log_file.get()));
     config.setTimeout(static_cast<uint32_t>(options.timeout_seconds * 1000.0));
     config.setSecurityMode(ParseSecurityMode(options.mode));
     if (!options.username.empty()) {
@@ -285,7 +346,14 @@ struct OpcuaClient::Impl {
     client = std::make_unique<opcua::Client>(std::move(config));
   }
 
+  struct FileCloser {
+    void operator()(std::FILE* file) const { std::fclose(file); }
+  };
+
   SecurityOptions options;
+  // Declared before `client` so the log destination outlives the client's
+  // logger on destruction.
+  std::unique_ptr<std::FILE, FileCloser> log_file;
   std::unique_ptr<opcua::Client> client;
 };
 
@@ -349,7 +417,7 @@ WriteResult OpcuaClient::Write(const std::string& node_id_text,
   opcua::StatusCode status = opcua::services::writeValue(
       *impl_->client, node_id, MakeVariant(value, type));
   return {node_id_text, value, type.empty() ? "Int32" : type,
-          StatusToString(status)};
+          StatusToString(status), status.isBad()};
 }
 
 std::vector<EndpointInfo> OpcuaClient::Endpoints(const std::string& endpoint) {
