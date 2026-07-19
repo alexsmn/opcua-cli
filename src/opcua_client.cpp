@@ -4,10 +4,12 @@
 
 #include <chrono>
 #include <cstdio>
+#include <deque>
 #include <memory>
 #include <stdexcept>
 #include <string_view>
 #include <thread>
+#include <unordered_set>
 
 namespace {
 
@@ -123,6 +125,34 @@ opcua::NodeId ParseNodeId(const std::string& text) {
 
 std::string NodeIdToString(const opcua::NodeId& id) {
   return ToString(opcua::toString(id));
+}
+
+// Canonical OPC UA NodeId text without the surrounding quotes that
+// opcua::toString adds — the form UANodeSet uses for NodeId attributes and
+// references: "i=2253", "ns=7;i=310", "ns=1;s=the.node".
+std::string FormatNodeId(const opcua::NodeId& id) {
+  std::string out;
+  if (id.namespaceIndex() != 0) {
+    out += "ns=" + std::to_string(id.namespaceIndex()) + ";";
+  }
+  switch (id.identifierType()) {
+    case opcua::NodeIdType::Numeric:
+      out += "i=" + std::to_string(*id.identifierIf<uint32_t>());
+      break;
+    case opcua::NodeIdType::String:
+      out += "s=" + ToString(*id.identifierIf<opcua::String>());
+      break;
+    case opcua::NodeIdType::Guid:
+    case opcua::NodeIdType::ByteString:
+      // Rare in a SCADA address space; fall back to the library rendering
+      // with its quotes stripped.
+      out = ToString(opcua::toString(id));
+      if (out.size() >= 2 && out.front() == '"' && out.back() == '"') {
+        out = out.substr(1, out.size() - 2);
+      }
+      break;
+  }
+  return out;
 }
 
 opcua::AttributeId AttributeId(const std::string& name) {
@@ -448,6 +478,172 @@ std::vector<ReadResult> OpcuaClient::Poll(const std::string& node_id,
     std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms));
   } while (true);
   return values;
+}
+
+namespace {
+
+std::optional<std::string> ExtractValuePreview(const opcua::DataValue& dv) {
+  if (!dv.hasValue()) {
+    return std::nullopt;
+  }
+  std::string text = VariantToString(dv.value());
+  constexpr std::size_t kMaxPreview = 120;
+  if (text.size() > kMaxPreview) {
+    text = text.substr(0, kMaxPreview) + "…";
+  }
+  return text;
+}
+
+// The structural attributes read for every node, in this fixed order. Value
+// is appended only when the caller opts in (it can block on device I/O), so
+// it always occupies the last slot when present.
+constexpr opcua::AttributeId kStructuralAttributes[] = {
+    opcua::AttributeId::NodeClass,   opcua::AttributeId::BrowseName,
+    opcua::AttributeId::DisplayName, opcua::AttributeId::Description,
+    opcua::AttributeId::DataType,    opcua::AttributeId::ValueRank,
+    opcua::AttributeId::IsAbstract,  opcua::AttributeId::Symmetric,
+    opcua::AttributeId::InverseName,
+};
+constexpr std::size_t kValueSlot = std::size(kStructuralAttributes);
+
+// Reads, in a single Read request, the structural attributes that any node
+// class might carry (plus Value when include_value is set). Attributes that do
+// not apply to the node return a Bad status and are left unset by the caller.
+std::vector<opcua::DataValue> ReadNodeAttributes(opcua::Client& client,
+                                                 const opcua::NodeId& id,
+                                                 bool include_value) {
+  std::vector<opcua::ReadValueId> to_read;
+  to_read.reserve(std::size(kStructuralAttributes) + 1);
+  for (const auto attribute : kStructuralAttributes) {
+    to_read.emplace_back(id, attribute);
+  }
+  if (include_value) {
+    to_read.emplace_back(id, opcua::AttributeId::Value);
+  }
+  opcua::ReadResponse response = opcua::services::read(
+      client, to_read, opcua::TimestampsToReturn::Neither);
+  std::vector<opcua::DataValue> results;
+  for (auto& value : response.results()) {
+    results.emplace_back(value);
+  }
+  return results;
+}
+
+}  // namespace
+
+NodesetDump OpcuaClient::DumpNodeset(const std::string& root_node,
+                                     std::optional<int> namespace_filter,
+                                     std::size_t max_nodes,
+                                     bool include_values) {
+  opcua::Client& client = *impl_->client;
+  NodesetDump dump;
+
+  // Server namespace array (i=2255): index 0 is the OPC UA namespace, so the
+  // emitted list starts at index 1.
+  auto ns_value = opcua::services::readAttribute(
+      client, opcua::NodeId(0, 2255), opcua::AttributeId::Value,
+      opcua::TimestampsToReturn::Neither);
+  if (ns_value && ns_value->hasValue() && ns_value->value().isArray()) {
+    const auto uris = ns_value->value().array<opcua::String>();
+    for (std::size_t i = 1; i < uris.size(); ++i) {
+      dump.namespace_uris.emplace_back(ToString(uris[i]));
+    }
+  }
+
+  std::deque<opcua::NodeId> queue;
+  std::unordered_set<std::string> visited;
+  const opcua::NodeId root = ParseNodeId(root_node);
+  queue.push_back(root);
+  visited.insert(FormatNodeId(root));
+
+  while (!queue.empty() && dump.nodes.size() < max_nodes) {
+    const opcua::NodeId id = queue.front();
+    queue.pop_front();
+
+    // Forward references from this node (all reference types, subtypes
+    // included): these define the node's place in the hierarchy and feed the
+    // crawl frontier.
+    opcua::BrowseDescription description(
+        id, opcua::BrowseDirection::Forward, opcua::ReferenceTypeId::References,
+        true, opcua::NodeClass::Unspecified, opcua::BrowseResultMask::All);
+    auto refs = opcua::services::browseAll(client, description);
+
+    const auto attributes = ReadNodeAttributes(client, id, include_values);
+    if (attributes.size() < kValueSlot || !attributes[0].hasValue()) {
+      // Could not read even the NodeClass: skip (e.g. a dangling reference
+      // target that is not a real node).
+      continue;
+    }
+
+    NodesetNode node;
+    node.node_id = FormatNodeId(id);
+    node.node_class = NodeClassName(
+        static_cast<opcua::NodeClass>(attributes[0].value().scalar<int32_t>()));
+    if (attributes[1].hasValue()) {
+      const auto browse = attributes[1].value().scalar<opcua::QualifiedName>();
+      node.browse_ns = browse.namespaceIndex();
+      node.browse_name = ToString(browse.name());
+    }
+    if (attributes[2].hasValue()) {
+      node.display_name =
+          ToString(attributes[2].value().scalar<opcua::LocalizedText>().text());
+    }
+    if (attributes[3].hasValue()) {
+      node.description =
+          ToString(attributes[3].value().scalar<opcua::LocalizedText>().text());
+    }
+    if (attributes[4].hasValue()) {
+      node.data_type =
+          FormatNodeId(attributes[4].value().scalar<opcua::NodeId>());
+    }
+    if (attributes[5].hasValue()) {
+      node.value_rank = attributes[5].value().scalar<int32_t>();
+    }
+    if (attributes[6].hasValue()) {
+      node.is_abstract = attributes[6].value().scalar<bool>();
+    }
+    if (attributes[7].hasValue()) {
+      node.symmetric = attributes[7].value().scalar<bool>();
+    }
+    if (attributes[8].hasValue()) {
+      node.inverse_name =
+          ToString(attributes[8].value().scalar<opcua::LocalizedText>().text());
+    }
+    if (include_values && attributes.size() > kValueSlot) {
+      node.value_preview = ExtractValuePreview(attributes[kValueSlot]);
+    }
+
+    for (const auto& ref : refs.value()) {
+      if (!ref.isForward()) {
+        continue;
+      }
+      NodesetReference reference;
+      reference.reference_type = FormatNodeId(ref.referenceTypeId());
+      reference.target = FormatNodeId(ref.nodeId().nodeId());
+      node.references.push_back(std::move(reference));
+
+      // Enqueue local, not-yet-seen targets. GUID identifiers are skipped
+      // (BrowseNode does the same) because they are not addressable here.
+      if (ref.nodeId().isLocal() &&
+          ref.nodeId().nodeId().identifierType() !=
+              opcua::NodeIdType::Guid) {
+        const std::string target = FormatNodeId(ref.nodeId().nodeId());
+        if (visited.insert(target).second) {
+          queue.push_back(ref.nodeId().nodeId());
+        }
+      }
+    }
+
+    const bool in_scope =
+        !namespace_filter ||
+        id.namespaceIndex() == static_cast<opcua::NamespaceIndex>(
+                                   *namespace_filter);
+    if (in_scope) {
+      dump.nodes.push_back(std::move(node));
+    }
+  }
+
+  return dump;
 }
 
 std::string StatusToString(std::uint32_t status_code) {

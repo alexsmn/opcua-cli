@@ -5,6 +5,7 @@
 #include <fstream>
 #include <regex>
 #include <stdexcept>
+#include <string_view>
 
 namespace {
 
@@ -104,20 +105,104 @@ void GenerateNodeset(const std::string& input,
          << "\n#endif  // GENERATED_NODEIDS_H_\n";
 }
 
-void DumpNodesetPlaceholder(const std::string& output_file,
-                            std::optional<int> namespace_index) {
+namespace {
+
+std::string XmlEscape(std::string_view value) {
+  std::string out;
+  out.reserve(value.size());
+  for (char ch : value) {
+    switch (ch) {
+      case '&':
+        out += "&amp;";
+        break;
+      case '<':
+        out += "&lt;";
+        break;
+      case '>':
+        out += "&gt;";
+        break;
+      case '"':
+        out += "&quot;";
+        break;
+      default:
+        out += ch;
+    }
+  }
+  return out;
+}
+
+// UANodeSet element name for a NodeClass string.
+std::string ElementName(const std::string& node_class) {
+  return "UA" + node_class;
+}
+
+}  // namespace
+
+void WriteNodeset(const std::string& output_file, const NodesetDump& dump) {
   std::ofstream out(output_file);
   if (!out) {
     throw std::runtime_error("Cannot write NodeSet file: " + output_file);
   }
+
   out << "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n";
   out << "<UANodeSet "
-         "xmlns=\"http://opcfoundation.org/UA/2011/03/UANodeSet.xsd\">\n";
-  out << "  <NamespaceUris>\n";
-  if (namespace_index) {
-    out << "    <!-- Runtime dump requested for namespace " << *namespace_index
-        << ". -->\n";
+         "xmlns=\"http://opcfoundation.org/UA/2011/03/UANodeSet.xsd\" "
+         "xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">\n";
+
+  // NamespaceUris lists the server's namespaces from index 1 onward; index 0
+  // (the OPC UA namespace) is implicit and omitted, per the UANodeSet schema.
+  if (!dump.namespace_uris.empty()) {
+    out << "  <NamespaceUris>\n";
+    for (const auto& uri : dump.namespace_uris) {
+      out << "    <Uri>" << XmlEscape(uri) << "</Uri>\n";
+    }
+    out << "  </NamespaceUris>\n";
   }
-  out << "  </NamespaceUris>\n";
+
+  for (const auto& node : dump.nodes) {
+    const std::string element = ElementName(node.node_class);
+    out << "  <" << element << " NodeId=\"" << XmlEscape(node.node_id)
+        << "\" BrowseName=\"" << node.browse_ns << ":"
+        << XmlEscape(node.browse_name) << "\"";
+    if (node.data_type)
+      out << " DataType=\"" << XmlEscape(*node.data_type) << "\"";
+    if (node.value_rank)
+      out << " ValueRank=\"" << *node.value_rank << "\"";
+    if (node.is_abstract && *node.is_abstract)
+      out << " IsAbstract=\"true\"";
+    if (node.symmetric && *node.symmetric)
+      out << " Symmetric=\"true\"";
+    out << ">\n";
+
+    out << "    <DisplayName>" << XmlEscape(node.display_name)
+        << "</DisplayName>\n";
+    if (!node.description.empty()) {
+      out << "    <Description>" << XmlEscape(node.description)
+          << "</Description>\n";
+    }
+    if (node.inverse_name && !node.inverse_name->empty()) {
+      out << "    <InverseName>" << XmlEscape(*node.inverse_name)
+          << "</InverseName>\n";
+    }
+    // The live value is informational only: emitting a typed <Value> would
+    // require full DataValue encoding and could not round-trip every type, so
+    // it is preserved as a comment instead of an element.
+    if (node.value_preview && !node.value_preview->empty()) {
+      out << "    <!-- Value: " << XmlEscape(*node.value_preview) << " -->\n";
+    }
+
+    if (!node.references.empty()) {
+      out << "    <References>\n";
+      for (const auto& ref : node.references) {
+        out << "      <Reference ReferenceType=\""
+            << XmlEscape(ref.reference_type) << "\">" << XmlEscape(ref.target)
+            << "</Reference>\n";
+      }
+      out << "    </References>\n";
+    }
+
+    out << "  </" << element << ">\n";
+  }
+
   out << "</UANodeSet>\n";
 }

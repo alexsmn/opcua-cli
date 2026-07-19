@@ -34,7 +34,8 @@ void PrintUsage() {
       << "  watch ENDPOINT NODEID [--interval=N]\n"
       << "  generate:nodeset FILE [--output=generated] "
          "[--namespace=Generated::OpcUa]\n"
-      << "  dump:nodeset ENDPOINT --output=FILE [--namespace=N]\n\n"
+      << "  dump:nodeset ENDPOINT --output=FILE [--namespace=N] "
+         "[--root=NODEID] [--max-nodes=N] [--values]\n\n"
       << "Global options: --json, --debug, --debug-stderr, --debug-file=PATH,\n"
       << "  --security-policy=POLICY, --security-mode=MODE, --cert=PATH, "
          "--key=PATH,\n"
@@ -235,8 +236,21 @@ int main(int argc, char** argv) {
       std::optional<int> ns;
       if (args.options.count("namespace"))
         ns = std::stoi(args.options["namespace"]);
-      DumpNodesetPlaceholder(output, ns);
-      std::cout << "Written: " << output << "\n";
+      const std::string root = GetOption(args, "root", "i=84");
+      const std::size_t max_nodes = static_cast<std::size_t>(
+          std::stoull(GetOption(args, "max-nodes", "100000")));
+      const bool include_values = args.options.count("values") > 0;
+
+      OpcuaClient client(args.security);
+      client.Connect(args.positionals[0]);
+      NodesetDump dump =
+          client.DumpNodeset(root, ns, max_nodes, include_values);
+      WriteNodeset(output, dump);
+      std::cout << "Written: " << output << " (" << dump.nodes.size()
+                << " nodes";
+      if (dump.nodes.size() >= max_nodes)
+        std::cout << ", stopped at --max-nodes";
+      std::cout << ")\n";
       return 0;
     }
 

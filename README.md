@@ -47,8 +47,18 @@ opcua-cli write opc.tcp://localhost:4840 NODEID VALUE [--type=Int32] [--json]
 opcua-cli endpoints opc.tcp://localhost:4840 [--json]
 opcua-cli watch opc.tcp://localhost:4840 NODEID [--interval=250] [--json]
 opcua-cli generate:nodeset path/to/NodeSet2.xml [--output=generated] [--namespace=Generated::OpcUa]
-opcua-cli dump:nodeset opc.tcp://localhost:4840 --output=Server.NodeSet2.xml [--namespace=N]
+opcua-cli dump:nodeset opc.tcp://localhost:4840 --output=Server.NodeSet2.xml [--namespace=N] [--root=NODEID] [--max-nodes=N] [--values]
 ```
+
+`dump:nodeset` crawls the server's address space breadth-first from `--root`
+(default `i=84`, the Root node), following forward references, and writes a
+UANodeSet XML with each node's class, browse name, display name, description,
+per-class attributes, and forward references, plus the server's namespace URIs.
+`--namespace=N` restricts the emitted nodes to namespace index `N` (the crawl
+still traverses other namespaces to reach them); `--max-nodes` bounds the
+crawl. Node values are not read by default because reading device-backed
+variables can block on device I/O — pass `--values` to include each variable's
+current value as a comment.
 
 Global security and output flags mirror the PHP CLI where `open62541pp` exposes
 the feature through its stock client configuration:

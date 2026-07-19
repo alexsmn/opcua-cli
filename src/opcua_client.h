@@ -1,11 +1,14 @@
 #ifndef SRC_OPCUA_CLIENT_H_
 #define SRC_OPCUA_CLIENT_H_
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
 #include <vector>
+
+#include "nodeset.h"
 
 struct SecurityOptions {
   std::string policy = "None";
@@ -77,6 +80,19 @@ class OpcuaClient {
   std::vector<ReadResult> Poll(const std::string& node_id,
                                std::uint64_t interval_ms,
                                bool once);
+
+  // Crawls the address space breadth-first from root_node, following forward
+  // references, and returns the captured nodes plus the server namespace
+  // array. When namespace_filter is set, only nodes in that namespace index
+  // are emitted (the crawl still traverses through other namespaces to reach
+  // them). Stops after max_nodes have been emitted. When include_values is
+  // set, each Variable's current value is read and kept as a comment — this
+  // is off by default because reading device-backed values can block on
+  // device I/O and slow the crawl by orders of magnitude.
+  NodesetDump DumpNodeset(const std::string& root_node,
+                          std::optional<int> namespace_filter,
+                          std::size_t max_nodes,
+                          bool include_values);
 
  private:
   struct Impl;
