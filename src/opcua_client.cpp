@@ -622,11 +622,13 @@ NodesetDump OpcuaClient::DumpNodeset(const std::string& root_node,
       reference.target = FormatNodeId(ref.nodeId().nodeId());
       node.references.push_back(std::move(reference));
 
-      // Enqueue local, not-yet-seen targets. GUID identifiers are skipped
-      // (BrowseNode does the same) because they are not addressable here.
-      if (ref.nodeId().isLocal() &&
-          ref.nodeId().nodeId().identifierType() !=
-              opcua::NodeIdType::Guid) {
+      // Enqueue local, not-yet-seen targets. A null target (i=0) is never a
+      // real node, so browsing/reading it is pointless — and it can fail-stop
+      // servers that assert on a null routed NodeId, so never crawl into it.
+      // GUID identifiers are skipped (BrowseNode does the same) because they
+      // are not addressable here.
+      if (ref.nodeId().isLocal() && !ref.nodeId().nodeId().isNull() &&
+          ref.nodeId().nodeId().identifierType() != opcua::NodeIdType::Guid) {
         const std::string target = FormatNodeId(ref.nodeId().nodeId());
         if (visited.insert(target).second) {
           queue.push_back(ref.nodeId().nodeId());
