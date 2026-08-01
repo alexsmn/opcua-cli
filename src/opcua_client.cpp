@@ -701,6 +701,9 @@ std::vector<EndpointInfo> OpcuaClient::Endpoints(const std::string& endpoint) {
     for (const auto& token : endpoint_description.userIdentityTokens()) {
       info.user_token_policies.push_back(UserTokenName(token.tokenType()));
     }
+    for (const auto& url : endpoint_description.server().discoveryUrls()) {
+      info.discovery_urls.push_back(ToString(url));
+    }
     result.push_back(std::move(info));
   }
   return result;

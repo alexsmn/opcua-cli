@@ -114,6 +114,12 @@ struct EndpointInfo {
   std::string security_policy;
   std::string security_mode;
   std::vector<std::string> user_token_policies;
+  // discoveryUrls of the ApplicationDescription embedded in the endpoint
+  // (OPC UA Part 4 §7.2). Separate from endpoint_url, and worth seeing: a
+  // client that reconnects via FindServers dials one of these, so a server
+  // advertising an address only reachable inside its own network strands the
+  // reconnect while GetEndpoints still looks perfectly healthy.
+  std::vector<std::string> discovery_urls;
 };
 
 class OpcuaClient {

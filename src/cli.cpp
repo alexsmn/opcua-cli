@@ -188,11 +188,16 @@ boost::json::object EndpointToJson(const EndpointInfo& endpoint) {
   for (const auto& token : endpoint.user_token_policies) {
     tokens.push_back(boost::json::value(token));
   }
+  boost::json::array discovery_urls;
+  for (const auto& url : endpoint.discovery_urls) {
+    discovery_urls.push_back(boost::json::value(url));
+  }
   return {
       {"endpoint", endpoint.endpoint_url},
       {"security", endpoint.security_policy},
       {"mode", endpoint.security_mode},
       {"auth", std::move(tokens)},
+      {"discovery", std::move(discovery_urls)},
   };
 }
 
@@ -316,7 +321,19 @@ void PrintEndpoints(const std::vector<EndpointInfo>& endpoints) {
         std::cout << ", ";
       std::cout << endpoint.user_token_policies[i];
     }
-    std::cout << "\n\n";
+    std::cout << "\n";
+    // The address a reconnecting client is sent to, which need not be the one
+    // it dialled (OPC UA Part 4 §7.2 ApplicationDescription.discoveryUrls).
+    if (!endpoint.discovery_urls.empty()) {
+      std::cout << "Discovery: ";
+      for (std::size_t i = 0; i < endpoint.discovery_urls.size(); ++i) {
+        if (i != 0)
+          std::cout << ", ";
+        std::cout << endpoint.discovery_urls[i];
+      }
+      std::cout << "\n";
+    }
+    std::cout << "\n";
   }
 }
 
