@@ -62,8 +62,9 @@ checking the exit status: a pipeline reports the *last* command's status, so a
 These are load-bearing, and scripts depend on them:
 
 - **stdout carries only command output**, including `--json`. Client logs go to
-  stderr and show warnings and errors only. `--debug` opts into full logging;
-  `--debug-stderr` and `--debug-file=PATH` redirect it.
+  stderr and show warnings and errors only. Any one of `--debug`,
+  `--debug-stderr` and `--debug-file=PATH` turns on full logging and picks
+  where it goes (stdout, stderr, a file) — see the debug-flag entry below.
 - `--json` must emit machine-usable types: array values are real JSON arrays
   with typed elements, not strings. Never reintroduce a placeholder like the
   old `"<array>"`.
@@ -85,6 +86,16 @@ These are load-bearing, and scripts depend on them:
   gaining a "looks empty, print nothing" shortcut: the zeros *are* the signal.
   OPC UA Part 5 §6.4.2 makes EventId mandatory on every event, so all three are
   defects worth surfacing.
+- **Never deduplicate events.** `events` prints what arrives, repeats included.
+  The same §6.4.2 makes EventId unique per event, so a repeat is a server
+  defect, and a client-side dedupe would bury it exactly as normalising a null
+  EventId would. This is not hypothetical: the SCADA aggregating proxy delivers
+  ~0.6 duplicated events per monitored-item creation — same EventId, same
+  Time, same Message, twice within one subscription, confined to the first four
+  notifications (Seq 1–4, never 5+, while runs reach Seq 60). Confirmed on the
+  wire, in ordinary PublishResponses with no Republish involved, so it is the
+  server emitting twice and not open62541 redelivering. Anyone seeing repeats
+  in the output is seeing the server, not a bug here.
 - NodeIds are rendered in canonical form (`i=2253`, `ns=2;i=1001`) everywhere,
   never with the quotes `opcua::toString` adds. Use `FormatNodeId`.
 - `write` and `browse` exit nonzero when the server answers with a Bad status.
@@ -170,6 +181,58 @@ CreateMonitoredItems status.
 
 macOS has **no `timeout(1)`**; do not lean on it to bound a run. `watch` and
 `events` have `--duration` and `--count` for exactly this reason.
+
+### Telling a tool bug from a server bug
+
+When output looks wrong, the question is whether these bytes arrived or whether
+we invented them — and the answer is cheap. Against a tunnelled server the
+tunnel's local end is **plaintext OPC UA**, so a small logging TCP relay
+between `opcua-cli` and the tunnel records exactly what the server sent. No
+root, no `tcpdump`, nothing installed on the far host, and it beats a capture
+at the server: that one carries every other client's traffic to the same nodes,
+while the loopback stream is only ours. Run each invocation as its own TCP
+connection so run N pairs with capture N, then search the stream for the raw
+bytes in question (an EventId is its 8 bytes, `bytes.fromhex`).
+
+Two things that decide whether the answer is worth anything:
+
+- **Carry a control group through the same measurement.** Comparing "suspect"
+  counts against "known-good" counts *from the same capture* cancels out
+  whatever else is on the link. Proving a duplicated EventId appears twice
+  means nothing until singly-delivered ones are shown to appear exactly once.
+- **A control that reads impossibly is the finding, not a nuisance.** The first
+  run of this said "client-side duplication" from a comparison of `0 == 0`: a
+  `nc -z` readiness probe had opened a zero-byte connection the relay numbered
+  first, offsetting every run against its capture by one, so every search
+  missed. Events we had certainly received cannot occur zero times in the
+  stream that delivered them. Had the offset hit only the suspect group, the
+  control would have looked fine and the wrong answer would have shipped.
+
+Client-side observation stops at "the proxy's socket emitted it twice"; it
+cannot say *which* hop upstream doubled it. That needs server-side tracing, and
+against the GCP demo the tracing is **already live** — do not go building a
+capture rig before checking it:
+
+- The test target is the **GCP** demo VM (`scada-demo`, `us-west1-b`), reached
+  over an IAP tunnel. Not a local cluster. So telemetry goes to the managed
+  Google Cloud backends, not to anything self-hosted.
+- All seven tiers carry a `metrics` block with `traces.enabled = true` and
+  `sampling_ratio = 1.0`, exporting OTLP to `host.docker.internal:4317`. The
+  receiver is the Ops Agent's `otelopscol` on the VM host, forwarding to Cloud
+  Trace; spans are confirmed arriving. Container logs already go to Cloud
+  Logging via the `gcplogs` driver, which is what the `gcloud logging read`
+  queries throughout this work were reading.
+- The only gap for a which-hop question is **a span on notification emission**.
+  Cross-tier W3C `traceparent` propagation already works (gRPC `trace_id`
+  northbound, an OPC UA `RequestHeader.AdditionalHeader` entry between tiers),
+  so one span would join the existing waterfall. One change, not a project.
+
+Two traps that made this look absent when it is not, both worth avoiding next
+time: the exporter config lives in each tier's `configs/*.json`, **not** in
+container env vars, so `docker inspect | grep -i otel` finds nothing; and the
+collector is a **host-level agent**, not a container, so `docker ps | grep
+collector` finds nothing either. Check `ss -lntp | grep 4317` and the tier
+config. Details are documented on the SCADA side in `docs/ops/deployment.md`.
 
 ## Docs
 
