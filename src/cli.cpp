@@ -61,9 +61,15 @@ ParsedArgs Parse(int argc, char** argv) {
     std::string arg = argv[i];
     if (arg == "--json" || arg == "-j") {
       parsed.json = true;
-    } else if (arg == "--recursive" || arg == "--debug" || arg == "-d" ||
-               arg == "--debug-stderr") {
-      parsed.options[arg.substr(arg.rfind('-') + 1)] = "true";
+    } else if (arg == "-d") {
+      parsed.options["debug"] = "true";
+      // Long boolean flags deliberately fall through to the generic "--" case
+      // below, which strips exactly the two leading dashes. They used to be
+      // special-cased with substr(rfind('-') + 1), which keeps only the text
+      // after the *last* hyphen: --debug-stderr was stored as "stderr", so the
+      // lookup for "debug-stderr" never matched and the flag did nothing at
+      // all. Any hyphenated flag added to that list would have broken the same
+      // way, so the special case is gone rather than patched.
     } else if (arg == "-u" || arg == "-p" || arg == "-s" || arg == "-m" ||
                arg == "-t") {
       if (++i >= argc)
@@ -144,12 +150,9 @@ boost::json::object ReadToJson(const ReadResult& result) {
   boost::json::object object{
       // Value is the typed rendering: a scalar stays a scalar, an array is a
       // real JSON array. Consumers can index it instead of parsing text.
-      {"NodeId", result.node_id},
-      {"Attribute", result.attribute},
-      {"Value", result.json_value},
-      {"Type", result.type},
-      {"Status", result.status},
-      {"Source", result.source_timestamp},
+      {"NodeId", result.node_id},          {"Attribute", result.attribute},
+      {"Value", result.json_value},        {"Type", result.type},
+      {"Status", result.status},           {"Source", result.source_timestamp},
       {"Server", result.server_timestamp},
   };
   if (result.elements) {
@@ -166,12 +169,18 @@ boost::json::object BrowseToJson(const BrowseEntry& entry) {
   for (const auto& child : entry.children) {
     children.push_back(BrowseToJson(child));
   }
-  return {
+  boost::json::object object{
       {"name", entry.name},
       {"nodeId", entry.node_id},
       {"nodeClass", entry.node_class},
       {"children", std::move(children)},
   };
+  if (!entry.child_status.empty()) {
+    // Present only when the sub-browse failed, so `children: []` alone never
+    // has to carry two meanings.
+    object["childStatus"] = entry.child_status;
+  }
+  return object;
 }
 
 boost::json::object WriteToJson(const WriteResult& result) {
@@ -207,7 +216,12 @@ void PrintBrowseTree(const std::vector<BrowseEntry>& entries,
     const bool last = i + 1 == entries.size();
     const auto& entry = entries[i];
     std::cout << prefix << (last ? "`-- " : "|-- ") << entry.name << " ("
-              << entry.node_id << ") [" << entry.node_class << "]\n";
+              << entry.node_id << ") [" << entry.node_class << "]";
+    if (!entry.child_status.empty()) {
+      // A refused sub-browse would otherwise look like a childless node.
+      std::cout << "  !! browse failed: " << entry.child_status;
+    }
+    std::cout << "\n";
     PrintBrowseTree(entry.children, prefix + (last ? "    " : "|   "));
   }
 }
@@ -412,14 +426,37 @@ int main(int argc, char** argv) {
           args.positionals.size() > 1 ? args.positionals[1] : "/Objects";
       bool recursive = args.options.count("recursive") > 0;
       int depth = std::stoi(GetOption(args, "depth", "3"));
-      auto entries = client.Browse(target, recursive, depth);
+      auto result = client.Browse(target, recursive, depth);
       if (args.json) {
         boost::json::array values;
-        for (const auto& entry : entries)
+        for (const auto& entry : result.entries)
           values.push_back(BrowseToJson(entry));
-        std::cout << boost::json::serialize(values) << "\n";
+        if (result.bad) {
+          // Object rather than the bare array only on failure, so the shape
+          // scripts already parse is unchanged when the browse succeeds.
+          boost::json::object failure{
+              {"nodes", std::move(values)},
+              {"Status", result.status},
+          };
+          if (!result.hint.empty())
+            failure["Hint"] = result.hint;
+          std::cout << boost::json::serialize(failure) << "\n";
+        } else {
+          std::cout << boost::json::serialize(values) << "\n";
+        }
       } else {
-        PrintBrowseTree(entries);
+        PrintBrowseTree(result.entries);
+        if (result.bad) {
+          // On stderr: an empty stdout is the honest answer for a failed
+          // browse, and scripts piping stdout must not pick up the diagnosis
+          // as if it were a node.
+          std::cerr << "error: browse failed: " << result.status << "\n";
+          if (!result.hint.empty())
+            std::cerr << "hint:  " << result.hint << "\n";
+        }
+      }
+      if (result.bad) {
+        return 1;
       }
     } else if (args.command == "read") {
       RequirePositionals(args, 2);

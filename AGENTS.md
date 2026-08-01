@@ -82,7 +82,20 @@ These are load-bearing, and scripts depend on them:
   so an event without one is always a defect worth surfacing.
 - NodeIds are rendered in canonical form (`i=2253`, `ns=2;i=1001`) everywhere,
   never with the quotes `opcua::toString` adds. Use `FormatNodeId`.
-- `write` exits nonzero when the server answers with a Bad status.
+- `write` and `browse` exit nonzero when the server answers with a Bad status.
+  **An empty result must never stand in for an error.** `browse` used to return
+  a bare empty vector when the Browse service answered Bad, so a refused node
+  and a childless one printed identically — the exact class of misreport this
+  tool exists to avoid. The status is now carried out of `BrowseNode` and
+  surfaced with a hint; failed sub-browses in a `--recursive` crawl are marked
+  per-node rather than rendering as leaves. Use `browseAll`, not `browse`: it
+  follows continuation points, so large nodes are not silently truncated.
+- Each debug flag enables full logging on its own; they select a destination,
+  they do not modify `--debug`. Keying the log level off `--debug` alone made
+  `--debug-stderr` a no-op (it chose the destination logs already went to).
+  Note also that boolean long flags must strip exactly the two leading dashes:
+  an old `substr(rfind('-') + 1)` stored `--debug-stderr` as `"stderr"`, so it
+  never reached `SecurityOptions` — any hyphenated flag would break the same way.
 - A status code that is the server's *correct* answer but reads like a tool
   failure should carry a `Hint` explaining it (see `ExplainAttributeIdInvalid`).
 

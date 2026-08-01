@@ -32,6 +32,24 @@ struct BrowseEntry {
   std::string node_id;
   std::string node_class;
   std::vector<BrowseEntry> children;
+  // Set when browsing *this* node's children failed during a --recursive
+  // crawl. Without it a node the server refused and a node with no children
+  // both render as a bare leaf, which is the same defect as an empty top-level
+  // browse one level down.
+  std::string child_status;
+};
+
+struct BrowseResult {
+  std::vector<BrowseEntry> entries;
+  // Status of the Browse service call for the requested node. Carried out
+  // rather than discarded: an empty `entries` on its own cannot distinguish
+  // "the server refused" from "this node has no children", and conflating
+  // those is exactly the kind of misreport this tool exists to avoid.
+  std::string status;
+  // True when the server answered the top-level browse with a Bad status; the
+  // CLI exits nonzero so scripts can tell a failed browse from an empty one.
+  bool bad = false;
+  std::string hint;
 };
 
 struct ReadResult {
@@ -133,9 +151,7 @@ class OpcuaClient {
   void Connect(const std::string& endpoint);
   void Disconnect();
 
-  std::vector<BrowseEntry> Browse(const std::string& target,
-                                  bool recursive,
-                                  int depth);
+  BrowseResult Browse(const std::string& target, bool recursive, int depth);
   ReadResult Read(const std::string& node_id, const std::string& attribute);
   WriteResult Write(const std::string& node_id,
                     const std::string& value,

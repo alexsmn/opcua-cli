@@ -217,11 +217,24 @@ opcua-cli read opc.tcp://localhost:4840 i=2255
   `BadAttributeIdInvalid`; the CLI adds a `Hint` line naming the node class and
   pointing at `--attribute=DisplayName` or `browse`.
 - stdout carries only command output (including `--json`); client logs go to
-  stderr and show warnings and errors only. `--debug` enables full logging
-  (on stdout, or stderr with `--debug-stderr`, or a file with
-  `--debug-file=PATH`).
+  stderr and show warnings and errors only. Each of `--debug`, `--debug-stderr`
+  and `--debug-file=PATH` enables full logging on its own and picks where it
+  goes — stdout, stderr, or a file respectively. They are destinations, not
+  modifiers: none of them needs to be combined with another to take effect.
 - `write` exits with code 1 when the server answers with a Bad status, so
   scripts can detect rejected writes without parsing output.
+- `browse` does the same, and never reports a server error as an empty node.
+  A refused browse prints the status and a hint on stderr, leaves stdout empty,
+  and exits 1; under `--json` it emits `{"nodes": [...], "Status": ..., "Hint":
+  ...}` instead of the bare array. In a `--recursive` crawl a node whose own
+  children could not be listed is marked `!! browse failed: STATUS` in the tree
+  and carries `childStatus` in JSON, so a refusal is never mistaken for a leaf:
+
+  ```
+  $ opcua-cli browse opc.tcp://localhost:4840 'ns=99;i=424242'
+  error: browse failed: BadNodeIdUnknown (0x80340000)
+  hint:  The server has no node with this NodeId. Check the namespace index — ...
+  ```
 - Status codes missing from open62541's name table (vendor-specific server
   codes) are reported by severity, e.g. `Bad (vendor-specific) (0x80300000)`.
 

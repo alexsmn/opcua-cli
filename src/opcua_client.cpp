@@ -474,8 +474,16 @@ opcua::LogFunction MakeLogFunction(const SecurityOptions& options,
                            : options.debug_stderr ? stderr
                            : options.debug        ? stdout
                                                   : stderr;
+  // Any of the three debug flags turns on full logging, not just --debug.
+  // Keying the level off --debug alone made --debug-stderr a complete no-op:
+  // it selected the destination logs already went to and left the threshold at
+  // Warning, so asking for debug output produced no extra output at all.
+  // --debug-file was nearly as bad, writing a file that stayed empty on a
+  // healthy run. Nobody passes a debug flag to change nothing.
+  const bool full_logging =
+      options.debug || options.debug_stderr || !options.debug_file.empty();
   const opcua::LogLevel min_level =
-      options.debug ? opcua::LogLevel::Debug : opcua::LogLevel::Warning;
+      full_logging ? opcua::LogLevel::Debug : opcua::LogLevel::Warning;
   return [destination, min_level](opcua::LogLevel level,
                                   opcua::LogCategory /*category*/,
                                   std::string_view message) {
@@ -542,23 +550,33 @@ void ValidateEndpointScheme(const std::string& endpoint) {
   }
 }
 
+// Browses one node's forward hierarchical references. `status` receives the
+// service result so the caller can tell a refusal from a childless node —
+// returning a bare empty vector on Bad conflates the two, and a diagnostic
+// client that reports "no children" when the server said BadUserAccessDenied
+// is misreporting what the server holds.
+//
+// browseAll rather than browse: it follows continuation points, so a node with
+// more references than the server returns in one response is not silently
+// truncated (dump:nodeset has always used it for the same reason).
 std::vector<BrowseEntry> BrowseNode(opcua::Client& client,
                                     const opcua::NodeId& node_id,
                                     bool recursive,
-                                    int depth) {
+                                    int depth,
+                                    opcua::StatusCode& status) {
   opcua::BrowseDescription description(
       node_id, opcua::BrowseDirection::Forward,
       opcua::ReferenceTypeId::HierarchicalReferences, true,
       opcua::NodeClass::Unspecified, opcua::BrowseResultMask::All);
 
-  opcua::BrowseResult response =
-      opcua::services::browse(client, description, 0);
+  auto response = opcua::services::browseAll(client, description);
+  status = response.code();
   std::vector<BrowseEntry> entries;
-  if (response.statusCode().isBad()) {
+  if (status.isBad()) {
     return entries;
   }
 
-  for (const auto& ref : response.references()) {
+  for (const auto& ref : response.value()) {
     if (!ref.nodeId().isLocal() ||
         ref.nodeId().nodeId().identifierType() == opcua::NodeIdType::Guid) {
       continue;
@@ -568,12 +586,50 @@ std::vector<BrowseEntry> BrowseNode(opcua::Client& client,
     entry.node_id = FormatNodeId(ref.nodeId().nodeId());
     entry.node_class = NodeClassName(ref.nodeClass());
     if (recursive && depth > 1) {
-      entry.children =
-          BrowseNode(client, ref.nodeId().nodeId(), true, depth - 1);
+      opcua::StatusCode child_status;
+      entry.children = BrowseNode(client, ref.nodeId().nodeId(), true,
+                                  depth - 1, child_status);
+      if (child_status.isBad()) {
+        entry.child_status = StatusToString(child_status);
+      }
     }
     entries.push_back(std::move(entry));
   }
   return entries;
+}
+
+// A browse that comes back Bad reads like the tool failed, so name the likely
+// cause the way ExplainAttributeIdInvalid does for reads. Only reached on the
+// error path, so the extra read costs nothing in the good case.
+std::string ExplainBrowseFailure(opcua::Client& client,
+                                 const opcua::NodeId& node_id,
+                                 opcua::StatusCode status) {
+  if (status == UA_STATUSCODE_BADNODEIDUNKNOWN) {
+    return "The server has no node with this NodeId. Check the namespace "
+           "index — ns=2;i=1001 and i=1001 are different nodes, and namespace "
+           "indices are per-server (read i=2255 for this server's list).";
+  }
+  if (status == UA_STATUSCODE_BADUSERACCESSDENIED) {
+    return "The server refused this browse for the current identity. Try "
+           "--username/--password, or browse a node the anonymous user can "
+           "see.";
+  }
+  // Anything else: say what is definitely true — the request reached the
+  // server and came back Bad, so this is the server's answer, not a silent
+  // empty result.
+  std::string hint =
+      "The server rejected the browse; this is its answer, not an empty node. "
+      "The connection is fine.";
+  auto read_class = opcua::services::readAttribute(
+      client, node_id, opcua::AttributeId::NodeClass,
+      opcua::TimestampsToReturn::Neither);
+  if (read_class && read_class->hasValue()) {
+    hint += " The node exists and is a " +
+            NodeClassName(static_cast<opcua::NodeClass>(
+                read_class->value().scalar<int32_t>())) +
+            " node.";
+  }
+  return hint;
 }
 
 }  // namespace
@@ -635,13 +691,21 @@ void OpcuaClient::Disconnect() {
   impl_->client->disconnect();
 }
 
-std::vector<BrowseEntry> OpcuaClient::Browse(const std::string& target,
-                                             bool recursive,
-                                             int depth) {
+BrowseResult OpcuaClient::Browse(const std::string& target,
+                                 bool recursive,
+                                 int depth) {
   const opcua::NodeId id = target.empty() || target == "/Objects"
                                ? opcua::NodeId(opcua::ObjectId::ObjectsFolder)
                                : ParseNodeId(target);
-  return BrowseNode(*impl_->client, id, recursive, depth);
+  opcua::StatusCode status;
+  BrowseResult result;
+  result.entries = BrowseNode(*impl_->client, id, recursive, depth, status);
+  result.status = StatusToString(status);
+  result.bad = status.isBad();
+  if (result.bad) {
+    result.hint = ExplainBrowseFailure(*impl_->client, id, status);
+  }
+  return result;
 }
 
 ReadResult OpcuaClient::Read(const std::string& node_id_text,
