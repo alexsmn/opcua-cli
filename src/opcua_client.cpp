@@ -818,9 +818,15 @@ std::string CheckEventNotifier(opcua::Client& client,
       client, node, opcua::AttributeId::EventNotifier,
       opcua::TimestampsToReturn::Neither);
   if (!value || !value->hasValue() || !value->value().isType<UA_Byte>()) {
+    // Deliberately weaker than the SubscribeToEvents case below: servers that
+    // do not expose the attribute at all still accept an event subscription
+    // and deliver — an aggregating proxy answering BadAttributeIdInvalid for
+    // EventNotifier on i=2253 was observed doing exactly that. Saying more
+    // than "watch out" here would be wrong.
     return node_id_text +
-           " has no readable EventNotifier attribute, so it is probably not an "
-           "event notifier. i=2253 (the Server object) always is.";
+           " does not expose a readable EventNotifier attribute. Some servers "
+           "omit it and still deliver events, so this is not conclusive — but "
+           "if nothing arrives, that is the first thing to suspect.";
   }
   const auto bits = value->value().scalar<UA_Byte>();
   if ((bits & static_cast<UA_Byte>(opcua::EventNotifier::SubscribeToEvents)) ==
