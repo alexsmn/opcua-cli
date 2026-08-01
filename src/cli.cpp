@@ -31,7 +31,8 @@ void PrintUsage() {
       << "  read ENDPOINT NODEID [--attribute=Value]\n"
       << "  write ENDPOINT NODEID VALUE [--type=Int32]\n"
       << "  endpoints ENDPOINT\n"
-      << "  watch ENDPOINT NODEID [--interval=N]\n"
+      << "  watch ENDPOINT NODEID [--interval=MS] [--duration=SECONDS] "
+         "[--count=N]\n"
       << "  generate:nodeset FILE [--output=generated] "
          "[--namespace=Generated::OpcUa]\n"
       << "  dump:nodeset ENDPOINT --output=FILE [--namespace=N] "
@@ -119,15 +120,24 @@ void RequirePositionals(const ParsedArgs& args, std::size_t count) {
 }
 
 boost::json::object ReadToJson(const ReadResult& result) {
-  return {
+  boost::json::object object{
+      // Value is the typed rendering: a scalar stays a scalar, an array is a
+      // real JSON array. Consumers can index it instead of parsing text.
       {"NodeId", result.node_id},
       {"Attribute", result.attribute},
-      {"Value", result.value},
+      {"Value", result.json_value},
       {"Type", result.type},
       {"Status", result.status},
       {"Source", result.source_timestamp},
       {"Server", result.server_timestamp},
   };
+  if (result.elements) {
+    object["Count"] = result.elements->size();
+  }
+  if (!result.hint.empty()) {
+    object["Hint"] = result.hint;
+  }
+  return object;
 }
 
 boost::json::object BrowseToJson(const BrowseEntry& entry) {
@@ -178,14 +188,27 @@ void PrintBrowseTree(const std::vector<BrowseEntry>& entries,
 
 void PrintRead(const ReadResult& result) {
   std::cout << "NodeId:     " << result.node_id << "\n"
-            << "Attribute:  " << result.attribute << "\n"
-            << "Value:      " << result.value << "\n"
-            << "Type:       " << result.type << "\n"
+            << "Attribute:  " << result.attribute << "\n";
+  if (result.elements) {
+    // Arrays are listed one element per line with the index, because for the
+    // arrays worth reading — NamespaceArray above all — element N *is*
+    // index N, and that mapping is the whole point of the read.
+    std::cout << "Value:      " << result.type << "[" << result.elements->size()
+              << "]\n";
+    for (std::size_t i = 0; i < result.elements->size(); ++i) {
+      std::cout << "  [" << i << "] " << (*result.elements)[i] << "\n";
+    }
+  } else {
+    std::cout << "Value:      " << result.value << "\n";
+  }
+  std::cout << "Type:       " << result.type << "\n"
             << "Status:     " << result.status << "\n";
   if (!result.source_timestamp.empty())
     std::cout << "Source:     " << result.source_timestamp << "\n";
   if (!result.server_timestamp.empty())
     std::cout << "Server:     " << result.server_timestamp << "\n";
+  if (!result.hint.empty())
+    std::cout << "Hint:       " << result.hint << "\n";
 }
 
 void PrintEndpoints(const std::vector<EndpointInfo>& endpoints) {
@@ -313,18 +336,41 @@ int main(int argc, char** argv) {
       }
     } else if (args.command == "watch") {
       RequirePositionals(args, 2);
-      auto interval = static_cast<std::uint64_t>(
+      const auto interval = std::chrono::milliseconds(
           std::stoull(GetOption(args, "interval", "1000")));
-      while (true) {
+      // Self-termination limits. --duration is wall-clock seconds and --count
+      // is a sample count; whichever is reached first ends the watch, and
+      // without either it runs until interrupted, as before. Deliberately
+      // separate from --timeout, which is the connect/request timeout.
+      using Clock = std::chrono::steady_clock;
+      std::optional<Clock::time_point> deadline;
+      if (args.options.count("duration")) {
+        const std::chrono::duration<double> seconds(
+            std::stod(args.options["duration"]));
+        deadline = Clock::now() + std::chrono::duration_cast<Clock::duration>(
+                                      seconds);
+      }
+      std::optional<std::uint64_t> count;
+      if (args.options.count("count")) {
+        count = std::stoull(args.options["count"]);
+      }
+
+      for (std::uint64_t taken = 0; !count || taken < *count; ++taken) {
         auto result = client.Read(args.positionals[1], "Value");
         // Flush per tick: with stdout on a pipe the stream is block-buffered,
-        // and an endless watch would otherwise show nothing for minutes.
+        // and a long watch would otherwise show nothing for minutes.
         if (args.json) {
           std::cout << boost::json::serialize(ReadToJson(result)) << std::endl;
         } else {
           std::cout << result.value << std::endl;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(interval));
+        const auto next = Clock::now() + interval;
+        // Stop rather than sleep past the deadline, so --duration bounds the
+        // total runtime instead of rounding up to the next whole interval.
+        if (deadline && next >= *deadline) {
+          break;
+        }
+        std::this_thread::sleep_until(next);
       }
     } else {
       throw std::runtime_error("Unknown command: " + args.command);

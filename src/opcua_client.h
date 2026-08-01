@@ -1,6 +1,8 @@
 #ifndef SRC_OPCUA_CLIENT_H_
 #define SRC_OPCUA_CLIENT_H_
 
+#include <boost/json/value.hpp>
+
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -34,11 +36,25 @@ struct BrowseEntry {
 struct ReadResult {
   std::string node_id;
   std::string attribute;
+  // Single-line rendering of the value: a scalar as-is, an array as
+  // "[a, b, c]". `watch` prints this per sample, so it must stay one line.
   std::string value;
+  // Set when the value is an array: one rendered element per entry, in order.
+  // The index carries meaning for the arrays this tool exists to inspect —
+  // element N of the NamespaceArray *is* namespace index N — so `read`
+  // prints them indexed rather than as a blob.
+  std::optional<std::vector<std::string>> elements;
+  // Typed rendering for --json: scalars stay scalars, arrays become real JSON
+  // arrays. Null when the read returned no value.
+  boost::json::value json_value;
   std::string type;
   std::string status;
   std::string source_timestamp;
   std::string server_timestamp;
+  // Plain-language explanation set when the status code is likely to be read
+  // as a tool malfunction rather than as the server's correct answer (e.g.
+  // BadAttributeIdInvalid for Value on an Object node).
+  std::string hint;
 };
 
 struct WriteResult {

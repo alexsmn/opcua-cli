@@ -2,14 +2,22 @@
 
 #include <open62541pp/open62541pp.hpp>
 
+#include <boost/json.hpp>
+
+#include <charconv>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <deque>
 #include <memory>
+#include <optional>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <unordered_set>
+#include <vector>
 
 namespace {
 
@@ -123,13 +131,11 @@ opcua::NodeId ParseNodeId(const std::string& text) {
                            " (supported: i=, ns=N;i=, ns=N;s=)");
 }
 
-std::string NodeIdToString(const opcua::NodeId& id) {
-  return ToString(opcua::toString(id));
-}
-
 // Canonical OPC UA NodeId text without the surrounding quotes that
 // opcua::toString adds — the form UANodeSet uses for NodeId attributes and
-// references: "i=2253", "ns=7;i=310", "ns=1;s=the.node".
+// references, and the form every command emits: i=2253, ns=7;i=310,
+// ns=1;s=the.node. Quoted output could not be pasted back into another
+// invocation, and in --json it forced consumers to strip the inner quotes.
 std::string FormatNodeId(const opcua::NodeId& id) {
   std::string out;
   if (id.namespaceIndex() != 0) {
@@ -182,47 +188,174 @@ std::string VariantTypeName(const opcua::Variant& variant) {
   return variant.type()->typeName;
 }
 
-template <typename T>
-std::string ScalarToString(const opcua::Variant& variant) {
-  return std::to_string(variant.scalar<T>());
+// Calls `visit` with element `index` of the variant, statically typed as the
+// variant's data type. Scalars are treated as a single element at index 0, so
+// scalar and array values share one rendering path. Returns false when the
+// data type is not one rendered natively (structures, ExtensionObjects, ...),
+// leaving it to the caller to fall back to the type name.
+template <typename Visitor>
+bool VisitVariantElement(const opcua::Variant& variant,
+                         std::size_t index,
+                         Visitor&& visit) {
+  const auto dispatch = [&]<typename T>() {
+    if (!variant.isType<T>()) {
+      return false;
+    }
+    visit(variant.isScalar() ? variant.scalar<T>() : variant.array<T>()[index]);
+    return true;
+  };
+  return dispatch.template operator()<bool>() ||
+         dispatch.template operator()<UA_SByte>() ||
+         dispatch.template operator()<UA_Byte>() ||
+         dispatch.template operator()<UA_Int16>() ||
+         dispatch.template operator()<UA_UInt16>() ||
+         dispatch.template operator()<UA_Int32>() ||
+         dispatch.template operator()<UA_UInt32>() ||
+         dispatch.template operator()<UA_Int64>() ||
+         dispatch.template operator()<UA_UInt64>() ||
+         dispatch.template operator()<UA_Float>() ||
+         dispatch.template operator()<UA_Double>() ||
+         dispatch.template operator()<opcua::String>() ||
+         dispatch.template operator()<opcua::LocalizedText>() ||
+         dispatch.template operator()<opcua::QualifiedName>() ||
+         dispatch.template operator()<opcua::NodeId>() ||
+         dispatch.template operator()<opcua::DateTime>() ||
+         dispatch.template operator()<opcua::StatusCode>();
 }
 
+std::string DateTimeToString(opcua::DateTime value);
+
+// Shortest round-trip rendering. std::to_string would print a Double with six
+// fixed decimals, which silently turns a 1e-9 measurement into "0.000000" —
+// unacceptable in a tool whose whole job is reporting what a server holds.
+template <typename T>
+std::string FloatToString(T value) {
+  char buffer[64];
+  const auto [end, error] =
+      std::to_chars(buffer, buffer + sizeof(buffer), value);
+  if (error != std::errc()) {
+    return std::to_string(value);
+  }
+  return std::string(buffer, end);
+}
+
+std::string ElementToString(const opcua::Variant& variant, std::size_t index) {
+  std::string out;
+  const bool rendered =
+      VisitVariantElement(variant, index, [&out](const auto& element) {
+        using T = std::decay_t<decltype(element)>;
+        if constexpr (std::is_same_v<T, bool>) {
+          out = element ? "true" : "false";
+        } else if constexpr (std::is_same_v<T, opcua::String>) {
+          out = ToString(element);
+        } else if constexpr (std::is_same_v<T, opcua::LocalizedText>) {
+          out = ToString(element.text());
+        } else if constexpr (std::is_same_v<T, opcua::QualifiedName>) {
+          out = ToString(element.name());
+        } else if constexpr (std::is_same_v<T, opcua::NodeId>) {
+          // Canonical "ns=2;i=1001" text, not the library's quoted form: it
+          // can be pasted straight back into another opcua-cli invocation.
+          out = FormatNodeId(element);
+        } else if constexpr (std::is_same_v<T, opcua::DateTime>) {
+          out = DateTimeToString(element);
+        } else if constexpr (std::is_same_v<T, opcua::StatusCode>) {
+          out = StatusToString(element);
+        } else if constexpr (std::is_floating_point_v<T>) {
+          out = FloatToString(element);
+        } else {
+          out = std::to_string(element);
+        }
+      });
+  return rendered ? out : "<" + VariantTypeName(variant) + ">";
+}
+
+// Typed JSON for one element. Numbers stay numbers so `jq` arithmetic works;
+// everything else becomes the same text `read` shows.
+boost::json::value ElementToJson(const opcua::Variant& variant,
+                                 std::size_t index) {
+  boost::json::value out;
+  const bool rendered =
+      VisitVariantElement(variant, index, [&](const auto& element) {
+        using T = std::decay_t<decltype(element)>;
+        if constexpr (std::is_same_v<T, bool>) {
+          out = element;
+        } else if constexpr (std::is_floating_point_v<T>) {
+          // JSON has no NaN/Infinity literal and a device can absolutely
+          // report one, so fall back to the text form rather than emit
+          // something no JSON parser will accept.
+          if (std::isfinite(element)) {
+            out = static_cast<double>(element);
+          } else {
+            out = boost::json::string(std::to_string(element));
+          }
+        } else if constexpr (std::is_signed_v<T>) {
+          out = static_cast<std::int64_t>(element);
+        } else if constexpr (std::is_integral_v<T>) {
+          out = static_cast<std::uint64_t>(element);
+        } else {
+          out = boost::json::string(ElementToString(variant, index));
+        }
+      });
+  return rendered ? out : boost::json::value();
+}
+
+// A variant with no data type at all carries no value. Anything else is either
+// a scalar or an array — and an array of length zero is still an array, not a
+// null: "this server serves no namespaces" and "this attribute is unset" are
+// different answers and must not render alike.
+bool IsNullVariant(const opcua::Variant& variant) {
+  return variant.type() == nullptr;
+}
+
+// Single-line rendering used by `watch` and by the human `Value:` line.
 std::string VariantToString(const opcua::Variant& variant) {
-  if (!variant.isScalar() || variant.data() == nullptr) {
-    return variant.arrayLength() > 0 ? "<array>" : "null";
+  if (IsNullVariant(variant)) {
+    return "null";
   }
-  if (variant.isType<bool>()) {
-    return variant.scalar<bool>() ? "true" : "false";
+  if (variant.isScalar()) {
+    return ElementToString(variant, 0);
   }
-  if (variant.isType<UA_SByte>())
-    return ScalarToString<UA_SByte>(variant);
-  if (variant.isType<UA_Byte>())
-    return ScalarToString<UA_Byte>(variant);
-  if (variant.isType<UA_Int16>())
-    return ScalarToString<UA_Int16>(variant);
-  if (variant.isType<UA_UInt16>())
-    return ScalarToString<UA_UInt16>(variant);
-  if (variant.isType<UA_Int32>())
-    return ScalarToString<UA_Int32>(variant);
-  if (variant.isType<UA_UInt32>())
-    return ScalarToString<UA_UInt32>(variant);
-  if (variant.isType<UA_Int64>())
-    return ScalarToString<UA_Int64>(variant);
-  if (variant.isType<UA_UInt64>())
-    return ScalarToString<UA_UInt64>(variant);
-  if (variant.isType<UA_Float>())
-    return ScalarToString<UA_Float>(variant);
-  if (variant.isType<UA_Double>())
-    return ScalarToString<UA_Double>(variant);
-  if (variant.isType<opcua::String>())
-    return ToString(variant.scalar<opcua::String>());
-  if (variant.isType<opcua::LocalizedText>())
-    return ToString(variant.scalar<opcua::LocalizedText>().text());
-  if (variant.isType<opcua::QualifiedName>())
-    return ToString(variant.scalar<opcua::QualifiedName>().name());
-  if (variant.isType<opcua::NodeId>())
-    return NodeIdToString(variant.scalar<opcua::NodeId>());
-  return "<" + VariantTypeName(variant) + ">";
+  std::string out = "[";
+  const std::size_t count = variant.arrayLength();
+  for (std::size_t i = 0; i < count; ++i) {
+    if (i != 0) {
+      out += ", ";
+    }
+    out += ElementToString(variant, i);
+  }
+  return out + "]";
+}
+
+// Per-element rendering for the human `read` output. Only arrays get one; a
+// scalar is fully described by VariantToString.
+std::optional<std::vector<std::string>> VariantToElements(
+    const opcua::Variant& variant) {
+  if (IsNullVariant(variant) || variant.isScalar()) {
+    return std::nullopt;
+  }
+  std::vector<std::string> elements;
+  elements.reserve(variant.arrayLength());
+  for (std::size_t i = 0; i < variant.arrayLength(); ++i) {
+    elements.push_back(ElementToString(variant, i));
+  }
+  return elements;
+}
+
+// Typed rendering for --json: a scalar stays a JSON scalar, an array becomes a
+// real JSON array (never the string "<array>").
+boost::json::value VariantToJson(const opcua::Variant& variant) {
+  if (IsNullVariant(variant)) {
+    return boost::json::value();
+  }
+  if (variant.isScalar()) {
+    return ElementToJson(variant, 0);
+  }
+  boost::json::array out;
+  out.reserve(variant.arrayLength());
+  for (std::size_t i = 0; i < variant.arrayLength(); ++i) {
+    out.push_back(ElementToJson(variant, i));
+  }
+  return out;
 }
 
 std::string DateTimeToString(opcua::DateTime value) {
@@ -320,6 +453,60 @@ opcua::LogFunction MakeLogFunction(const SecurityOptions& options,
   };
 }
 
+// BadAttributeIdInvalid is the server correctly saying "this node has no such
+// attribute" — most often `read --attribute=Value` aimed at an Object, which
+// is a folder-like node with no value at all. Reported bare it reads like the
+// CLI broke, so name the node class and point at what to do instead. Only
+// reached on the error path, so the extra read costs nothing in the good case.
+std::string ExplainAttributeIdInvalid(opcua::Client& client,
+                                      const opcua::NodeId& node_id,
+                                      const std::string& attribute) {
+  std::string node_class = "This";
+  auto read_class = opcua::services::readAttribute(
+      client, node_id, opcua::AttributeId::NodeClass,
+      opcua::TimestampsToReturn::Neither);
+  if (read_class && read_class->hasValue()) {
+    node_class = NodeClassName(static_cast<opcua::NodeClass>(
+                     read_class->value().scalar<int32_t>())) +
+                 " node";
+  }
+  std::string hint = node_class + " has no " + attribute +
+                     " attribute — the server rejected the request, the "
+                     "connection is fine.";
+  if (attribute == "Value") {
+    hint +=
+        " Only Variable and VariableType nodes carry a Value; try "
+        "--attribute=DisplayName, or browse this node for child variables.";
+  }
+  return hint;
+}
+
+// Rejects transports this client cannot speak, before open62541 answers with a
+// bare BadTcpEndpointUrlInvalid that reads like a typo in the URL. See the
+// "Transport support" section of README.md for the full reasoning; the short
+// version is that open62541 1.4 ships no WebSocket transport at all, and a
+// server's WebSocket endpoint typically carries the UA-JSON mapping rather
+// than the binary protocol this client encodes.
+void ValidateEndpointScheme(const std::string& endpoint) {
+  static constexpr std::string_view kWebSocketSchemes[] = {
+      "opc.wss://", "opc.ws://", "wss://", "ws://", "https://", "http://"};
+  for (const auto scheme : kWebSocketSchemes) {
+    if (endpoint.rfind(scheme, 0) != 0) {
+      continue;
+    }
+    throw std::runtime_error(
+        std::string("unsupported endpoint scheme '") + std::string(scheme) +
+        "': opcua-cli speaks OPC UA binary over TCP (opc.tcp://) only.\n"
+        "  WebSocket endpoints are usually the UA-JSON mapping (subprotocol "
+        "opcua+uajson), a different\n"
+        "  wire encoding, and open62541 provides no WebSocket transport to "
+        "build on either.\n"
+        "  Use the server's opc.tcp:// endpoint, tunnelling if it is not "
+        "routable: ssh -L 4840:localhost:4840 HOST\n"
+        "  then: opcua-cli read opc.tcp://localhost:4840 i=2255");
+  }
+}
+
 std::vector<BrowseEntry> BrowseNode(opcua::Client& client,
                                     const opcua::NodeId& node_id,
                                     bool recursive,
@@ -343,7 +530,7 @@ std::vector<BrowseEntry> BrowseNode(opcua::Client& client,
     }
     BrowseEntry entry;
     entry.name = ToString(ref.displayName().text());
-    entry.node_id = NodeIdToString(ref.nodeId().nodeId());
+    entry.node_id = FormatNodeId(ref.nodeId().nodeId());
     entry.node_class = NodeClassName(ref.nodeClass());
     if (recursive && depth > 1) {
       entry.children =
@@ -392,6 +579,7 @@ OpcuaClient::OpcuaClient(SecurityOptions options)
 OpcuaClient::~OpcuaClient() = default;
 
 void OpcuaClient::Connect(const std::string& endpoint) {
+  ValidateEndpointScheme(endpoint);
   try {
     impl_->client->connect(endpoint);
   } catch (const opcua::BadStatus& error) {
@@ -423,11 +611,15 @@ ReadResult OpcuaClient::Read(const std::string& node_id_text,
   result.node_id = node_id_text;
   result.attribute = attribute;
   result.status = StatusToString(data_value.code());
+  opcua::StatusCode status = data_value.code();
   if (data_value) {
     const opcua::DataValue& value = data_value.value();
-    result.status = StatusToString(value.status());
+    status = value.status();
+    result.status = StatusToString(status);
     if (value.hasValue()) {
       result.value = VariantToString(value.value());
+      result.elements = VariantToElements(value.value());
+      result.json_value = VariantToJson(value.value());
       result.type = VariantTypeName(value.value());
     }
     if (value.hasSourceTimestamp()) {
@@ -436,6 +628,9 @@ ReadResult OpcuaClient::Read(const std::string& node_id_text,
     if (value.hasServerTimestamp()) {
       result.server_timestamp = DateTimeToString(value.serverTimestamp());
     }
+  }
+  if (status == UA_STATUSCODE_BADATTRIBUTEIDINVALID) {
+    result.hint = ExplainAttributeIdInvalid(*impl_->client, node_id, attribute);
   }
   return result;
 }
@@ -451,6 +646,7 @@ WriteResult OpcuaClient::Write(const std::string& node_id_text,
 }
 
 std::vector<EndpointInfo> OpcuaClient::Endpoints(const std::string& endpoint) {
+  ValidateEndpointScheme(endpoint);
   std::vector<EndpointInfo> result;
   for (const auto& endpoint_description :
        impl_->client->getEndpoints(endpoint)) {
