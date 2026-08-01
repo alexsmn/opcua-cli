@@ -204,14 +204,25 @@ opcua-cli read opc.tcp://localhost:4840 i=2255
   command and in `--json`, so they can be pasted straight into another
   invocation.
 - ByteStrings — an `EventId` above all — are rendered as lowercase hex, cut at
-  64 bytes with the true length appended. **A missing one stays visible.** A
-  field the server sent with no value at all reads `<null>` (JSON `null`) and a
-  zero-length ByteString reads `<empty>`, in both cases distinct from an
-  ordinary value and never blanked out. OPC UA Part 5 §6.4.2 makes `EventId`
-  mandatory on every event, so an event arriving without one is a server or
-  proxy defect, and `events` exists in large part to make that defect
-  observable — `events … --json | jq 'select(.Fields.EventId == null)'` is the
-  intended way to catch it.
+  64 bytes with the true length appended. **A bad one stays visible, in all
+  three of its shapes.** A field the server sent with no value at all reads
+  `<null>` (JSON `null`), a zero-length ByteString reads `<empty>`, and an
+  all-zero one renders as its true hex (`0000000000000000`) — never blanked,
+  normalised or abbreviated. OPC UA Part 5 §6.4.2 makes `EventId` mandatory on
+  every event, so any of the three is a server or proxy defect, and `events`
+  exists in large part to make them observable.
+
+  The third shape is the one that matters in practice and the easiest to miss.
+  A phantom event reassembled from a payload-less notification carries
+  `EncodeEventIdByteString(0)`: **eight zero bytes — a well-formed ByteString
+  of the correct length**, neither null nor empty. A check written only against
+  `null` would wave it through as a valid id. Screen for all three:
+
+  ```sh
+  opcua-cli events … --json |
+    jq 'select(.Fields.EventId == null or .Fields.EventId == "<empty>"
+               or (.Fields.EventId | test("^0+$")))'
+  ```
 - `read` explains status codes that look like tool failures but are the
   server's correct answer. `--attribute=Value` on an Object node returns
   `BadAttributeIdInvalid`; the CLI adds a `Hint` line naming the node class and

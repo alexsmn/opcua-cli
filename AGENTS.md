@@ -72,14 +72,19 @@ These are load-bearing, and scripts depend on them:
   *everything* about the subscription itself — the confirmation line, the
   EventNotifier warning, rejected select clauses — on stderr, so stdout stays a
   clean stream of events.
-- **A missing EventId must stay visible.** A field the server sent with no
-  value renders `<null>` (JSON `null`), a zero-length ByteString `<empty>`, and
-  the two stay distinct. Never blank, normalise or pretty-print either away.
-  This is not cosmetic: `events` exists because an aggregating proxy projected
-  a payload-less status notification onto the wire as a field list of nulls,
-  which the far side reassembled into a phantom event with a zero/null
-  EventId — and OPC UA Part 5 §6.4.2 makes EventId mandatory on every event,
-  so an event without one is always a defect worth surfacing.
+- **A bad EventId must stay visible, and it has three shapes.** A field the
+  server sent with no value renders `<null>` (JSON `null`), a zero-length
+  ByteString `<empty>`, and an all-zero one renders as its true hex. All three
+  stay distinct; never blank, normalise or pretty-print any of them away.
+
+  The third is the one that actually occurs, and the one a "simplification"
+  will drop. The real phantom event carries `EncodeEventIdByteString(0)` —
+  **eight zero bytes, a well-formed ByteString of the correct length**, not an
+  absent field. Anything screening only for null/empty passes it as a valid id.
+  That is why the ByteString rendering must stay faithful hex rather than
+  gaining a "looks empty, print nothing" shortcut: the zeros *are* the signal.
+  OPC UA Part 5 §6.4.2 makes EventId mandatory on every event, so all three are
+  defects worth surfacing.
 - NodeIds are rendered in canonical form (`i=2253`, `ns=2;i=1001`) everywhere,
   never with the quotes `opcua::toString` adds. Use `FormatNodeId`.
 - `write` and `browse` exit nonzero when the server answers with a Bad status.
