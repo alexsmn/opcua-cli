@@ -4,11 +4,13 @@
 
 #include <boost/json.hpp>
 
+#include <algorithm>
 #include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -176,6 +178,8 @@ opcua::AttributeId AttributeId(const std::string& name) {
     return opcua::AttributeId::Description;
   if (name == "AccessLevel")
     return opcua::AttributeId::AccessLevel;
+  if (name == "EventNotifier")
+    return opcua::AttributeId::EventNotifier;
   if (name == "NodeId")
     return opcua::AttributeId::NodeId;
   throw std::runtime_error("Unsupported attribute: " + name);
@@ -216,6 +220,7 @@ bool VisitVariantElement(const opcua::Variant& variant,
          dispatch.template operator()<UA_Float>() ||
          dispatch.template operator()<UA_Double>() ||
          dispatch.template operator()<opcua::String>() ||
+         dispatch.template operator()<opcua::ByteString>() ||
          dispatch.template operator()<opcua::LocalizedText>() ||
          dispatch.template operator()<opcua::QualifiedName>() ||
          dispatch.template operator()<opcua::NodeId>() ||
@@ -224,6 +229,34 @@ bool VisitVariantElement(const opcua::Variant& variant,
 }
 
 std::string DateTimeToString(opcua::DateTime value);
+
+// A ByteString is opaque bytes, not text, so it is rendered as lowercase hex:
+// the value can then be compared and pasted. Two renderings are deliberately
+// *visible* rather than empty. A zero-length ByteString reads "<empty>",
+// because the ByteString this tool most often shows is an EventId, which OPC
+// UA Part 5 §6.4.2 makes mandatory on every event — an event carrying no
+// EventId is a server defect, and rendering it as nothing at all would hide
+// exactly the thing worth seeing. Long blobs (a certificate, say) are cut at
+// 64 bytes with the true length appended rather than flooding a line.
+std::string ByteStringToString(const opcua::ByteString& value) {
+  if (value.empty()) {
+    return "<empty>";
+  }
+  static constexpr char kHexDigits[] = "0123456789abcdef";
+  constexpr std::size_t kMaxBytes = 64;
+  const std::size_t shown = std::min(value.size(), kMaxBytes);
+  std::string out;
+  out.reserve(shown * 2 + 24);
+  for (std::size_t i = 0; i < shown; ++i) {
+    const auto byte = static_cast<unsigned char>(value.data()[i]);
+    out += kHexDigits[byte >> 4U];
+    out += kHexDigits[byte & 0x0FU];
+  }
+  if (shown < value.size()) {
+    out += "…(" + std::to_string(value.size()) + " bytes)";
+  }
+  return out;
+}
 
 // Shortest round-trip rendering. std::to_string would print a Double with six
 // fixed decimals, which silently turns a 1e-9 measurement into "0.000000" —
@@ -248,6 +281,8 @@ std::string ElementToString(const opcua::Variant& variant, std::size_t index) {
           out = element ? "true" : "false";
         } else if constexpr (std::is_same_v<T, opcua::String>) {
           out = ToString(element);
+        } else if constexpr (std::is_same_v<T, opcua::ByteString>) {
+          out = ByteStringToString(element);
         } else if constexpr (std::is_same_v<T, opcua::LocalizedText>) {
           out = ToString(element.text());
         } else if constexpr (std::is_same_v<T, opcua::QualifiedName>) {
@@ -555,6 +590,15 @@ struct OpcuaClient::Impl {
     opcua::ClientConfig config;
     config.setLogger(MakeLogFunction(options, log_file.get()));
     config.setTimeout(static_cast<uint32_t>(options.timeout_seconds * 1000.0));
+    // One publish request in flight instead of open62541's default ten. On
+    // teardown the session is closed with deleteSubscriptions set, so every
+    // queued publish request comes back BadNoSubscription and the client logs
+    // a warning for each — ten lines of noise on the same stderr channel
+    // `events` uses to report real problems. Nothing is lost by queueing less:
+    // the server holds notifications in the monitored item queue until a
+    // publish request is available and can answer a whole burst in one
+    // response, so the only cost is a round trip of latency per publish cycle.
+    config->outStandingPublishRequests = 1;
     config.setSecurityMode(ParseSecurityMode(options.mode));
     if (!options.username.empty()) {
       config.setUserIdentityToken(
@@ -678,6 +722,156 @@ std::vector<ReadResult> OpcuaClient::Poll(const std::string& node_id,
 
 namespace {
 
+// Parses one --select entry into a browse path below BaseEventType.
+// "Message" -> {0:Message}; "2:Vendor/Code" -> {2:Vendor, 0:Code}. The
+// namespace prefix defaults to 0 because the fields worth selecting by default
+// are the BaseEventType ones, which all live in the OPC UA namespace.
+std::vector<opcua::QualifiedName> ParseEventFieldPath(
+    const std::string& field) {
+  std::vector<opcua::QualifiedName> path;
+  std::size_t start = 0;
+  while (true) {
+    const auto slash = field.find('/', start);
+    std::string part = field.substr(
+        start, slash == std::string::npos ? std::string::npos : slash - start);
+    if (part.empty()) {
+      throw std::runtime_error("Invalid event field '" + field +
+                               "' (expected NAME, NS:NAME or A/B)");
+    }
+    opcua::NamespaceIndex ns = 0;
+    const auto colon = part.find(':');
+    if (colon != std::string::npos) {
+      const std::string prefix = part.substr(0, colon);
+      if (prefix.empty() ||
+          prefix.find_first_not_of("0123456789") != std::string::npos) {
+        throw std::runtime_error("Invalid namespace prefix in event field '" +
+                                 field +
+                                 "' (expected NS:NAME with NS numeric)");
+      }
+      ns = static_cast<opcua::NamespaceIndex>(std::stoul(prefix));
+      part = part.substr(colon + 1);
+    }
+    path.emplace_back(ns, part);
+    if (slash == std::string::npos) {
+      return path;
+    }
+    start = slash + 1;
+  }
+}
+
+// Renders one event field. Kept apart from VariantToString so that an absent
+// value reads "<null>" rather than the lowercase "null" a read prints: on an
+// event line every field is a name=value pair, and the whole point of this
+// command is that a missing EventId stands out.
+EventField MakeEventField(const std::string& name,
+                          const opcua::Variant& value) {
+  EventField field;
+  field.name = name;
+  field.type = VariantTypeName(value);
+  if (IsNullVariant(value)) {
+    field.value = "<null>";
+    field.json_value = boost::json::value();
+    return field;
+  }
+  field.value = VariantToString(value);
+  field.json_value = VariantToJson(value);
+  return field;
+}
+
+// Per-select-clause results from the server's EventFilterResult (OPC UA Part 4
+// §7.22.4.2). A clause the server answers Bad for still occupies its slot in
+// every notification, filled with a null — indistinguishable from the server
+// reporting a genuinely null field unless the rejection is reported here.
+std::vector<std::string> CollectRejectedSelectClauses(
+    const opcua::ExtensionObject& filter_result,
+    const std::vector<std::string>& fields) {
+  std::vector<std::string> rejected;
+  // Compared against the raw UA type rather than decodedData<T>() because
+  // UA_EventFilterResult has no open62541pp wrapper to look up.
+  if (filter_result.decodedType() != &UA_TYPES[UA_TYPES_EVENTFILTERRESULT]) {
+    return rejected;
+  }
+  const auto* result =
+      static_cast<const UA_EventFilterResult*>(filter_result.decodedData());
+  for (std::size_t i = 0; i < result->selectClauseResultsSize; ++i) {
+    const opcua::StatusCode status(result->selectClauseResults[i]);
+    if (!status.isBad()) {
+      continue;
+    }
+    const std::string name =
+        i < fields.size() ? fields[i] : ("clause " + std::to_string(i));
+    rejected.push_back(name + ": " + StatusToString(status));
+  }
+  return rejected;
+}
+
+// Best-effort pre-flight. A node whose EventNotifier attribute is missing, or
+// has the SubscribeToEvents bit clear (OPC UA Part 3 §5.6.2), will never send
+// an event; without this the user watches an idle terminal and cannot tell
+// that apart from a quiet server. Returns a warning, not an error, because the
+// authoritative answer is the CreateMonitoredItems status below and a server
+// that misreports its own attribute may still deliver.
+std::string CheckEventNotifier(opcua::Client& client,
+                               const opcua::NodeId& node,
+                               const std::string& node_id_text) {
+  auto value = opcua::services::readAttribute(
+      client, node, opcua::AttributeId::EventNotifier,
+      opcua::TimestampsToReturn::Neither);
+  if (!value || !value->hasValue() || !value->value().isType<UA_Byte>()) {
+    return node_id_text +
+           " has no readable EventNotifier attribute, so it is probably not an "
+           "event notifier. i=2253 (the Server object) always is.";
+  }
+  const auto bits = value->value().scalar<UA_Byte>();
+  if ((bits & static_cast<UA_Byte>(opcua::EventNotifier::SubscribeToEvents)) ==
+      0) {
+    return node_id_text + " has EventNotifier=" + std::to_string(bits) +
+           " with the SubscribeToEvents bit clear (OPC UA Part 3 §5.6.2): the "
+           "server does not offer event subscriptions on this node.";
+  }
+  return {};
+}
+
+// A rejected event monitored item reads like a broken tool, but it is usually
+// the server correctly refusing: either the node raises no events, or it will
+// not serve the requested EventFilter. Say which, in the style of
+// ExplainAttributeIdInvalid.
+std::string ExplainEventSubscribeFailure(
+    const std::string& node_id_text,
+    opcua::StatusCode status,
+    const std::vector<std::string>& rejected) {
+  std::string message = "Event subscription on " + node_id_text +
+                        " rejected: " + StatusToString(status);
+  switch (status.get()) {
+    case UA_STATUSCODE_BADATTRIBUTEIDINVALID:
+    case UA_STATUSCODE_BADNODEATTRIBUTESINVALID:
+    case UA_STATUSCODE_BADNOTSUPPORTED:
+      message +=
+          "\n  Hint: this node has no EventNotifier attribute, so it raises no "
+          "events — the server rejected the request, the connection is fine.\n"
+          "  Every server exposes the Server object i=2253 as an event "
+          "notifier; try that, or browse for a node whose EventNotifier has "
+          "the SubscribeToEvents bit set.";
+      break;
+    case UA_STATUSCODE_BADEVENTFILTERINVALID:
+    case UA_STATUSCODE_BADMONITOREDITEMFILTERINVALID:
+    case UA_STATUSCODE_BADMONITOREDITEMFILTERUNSUPPORTED:
+    case UA_STATUSCODE_BADFILTERNOTALLOWED:
+      message +=
+          "\n  Hint: the server rejected the EventFilter, not the connection. "
+          "Restrict --select to fields this\n"
+          "  server's event types define; the BaseEventType set (OPC UA Part 5 "
+          "§6.4.2) is the safe default.";
+      break;
+    default:
+      break;
+  }
+  for (const auto& field : rejected) {
+    message += "\n  Rejected select clause " + field;
+  }
+  return message;
+}
+
 std::optional<std::string> ExtractValuePreview(const opcua::DataValue& dv) {
   if (!dv.hasValue()) {
     return std::nullopt;
@@ -726,6 +920,158 @@ std::vector<opcua::DataValue> ReadNodeAttributes(opcua::Client& client,
 }
 
 }  // namespace
+
+std::vector<std::string> DefaultEventFields() {
+  return {"EventId", "EventType",   "SourceNode", "SourceName",
+          "Time",    "ReceiveTime", "Message",    "Severity"};
+}
+
+void OpcuaClient::SubscribeEvents(
+    const std::string& node_id_text,
+    const std::vector<std::string>& fields,
+    std::optional<double> duration_seconds,
+    std::optional<std::uint64_t> count,
+    const std::function<void(const EventSubscriptionInfo&)>& on_ready,
+    const std::function<void(const EventNotification&)>& on_event) {
+  opcua::Client& client = *impl_->client;
+  const opcua::NodeId node = ParseNodeId(node_id_text);
+  if (fields.empty()) {
+    throw std::runtime_error(
+        "Event subscription needs at least one select "
+        "clause (--select=EventId,Message,...)");
+  }
+
+  std::vector<opcua::SimpleAttributeOperand> select_clauses;
+  select_clauses.reserve(fields.size());
+  for (const auto& field : fields) {
+    // Every clause is rooted at BaseEventType: a select clause names the type
+    // that *defines* the field, and BaseEventType is the supertype of every
+    // event type, so its fields resolve on any concrete event a server sends
+    // (OPC UA Part 4 §7.7.4.5).
+    select_clauses.emplace_back(
+        opcua::NodeId(opcua::ObjectTypeId::BaseEventType),
+        ParseEventFieldPath(field), opcua::AttributeId::Value);
+  }
+  // An empty where clause means "no filtering": report every event the node
+  // raises. Narrowing by event type or severity is the server's job to support
+  // and not what this command is for.
+  const opcua::EventFilter event_filter(select_clauses, opcua::ContentFilter{});
+
+  EventSubscriptionInfo info;
+  info.warning = CheckEventNotifier(client, node, node_id_text);
+
+  const auto subscription = opcua::services::createSubscription(
+      client, opcua::SubscriptionParameters{}, true, {}, {});
+  const opcua::StatusCode subscription_status =
+      subscription.responseHeader().serviceResult();
+  if (subscription_status.isBad()) {
+    throw std::runtime_error("CreateSubscription failed: " +
+                             StatusToString(subscription_status));
+  }
+  const opcua::IntegerId subscription_id = subscription.subscriptionId();
+
+  // Delete the subscription on every exit path, including the throw below: a
+  // server keeps it alive for lifetimeCount publishing cycles otherwise, and a
+  // diagnostic tool run in a loop should not leave a trail of them.
+  struct SubscriptionGuard {
+    ~SubscriptionGuard() {
+      static_cast<void>(opcua::services::deleteSubscription(client, id));
+    }
+    opcua::Client& client;
+    opcua::IntegerId id;
+  } guard{client, subscription_id};
+
+  opcua::MonitoringParametersEx parameters;
+  parameters.filter = opcua::ExtensionObject(event_filter);
+  // Sampling does not apply to event items — the server queues events as they
+  // are raised (OPC UA Part 4 §5.12.1.3) — so ask for the fastest practical
+  // rate rather than leaving the data-change default of 250 ms.
+  parameters.samplingInterval = 0.0;
+  // The default queue size of 1 discards every event but the newest between
+  // publishes, which would hide exactly the bursts worth diagnosing.
+  parameters.queueSize = 1000;
+
+  std::uint64_t received = 0;
+  std::string callback_error;
+  const auto result = opcua::services::createMonitoredItemEvent(
+      client, subscription_id, {node, opcua::AttributeId::EventNotifier},
+      opcua::MonitoringMode::Reporting, parameters,
+      [&](opcua::IntegerId, opcua::IntegerId,
+          opcua::Span<const opcua::Variant> event_fields) {
+        // This runs inside open62541's C callback: an exception escaping here
+        // would unwind through C frames, so failures are recorded and the run
+        // loop below ends on them instead.
+        try {
+          EventNotification notification;
+          notification.sequence = ++received;
+          notification.fields.reserve(fields.size());
+          for (std::size_t i = 0; i < fields.size(); ++i) {
+            // A server may return fewer fields than clauses; the missing ones
+            // are null, exactly as a field it declined to fill would be.
+            static const opcua::Variant kAbsent;
+            notification.fields.push_back(MakeEventField(
+                fields[i],
+                i < event_fields.size() ? event_fields[i] : kAbsent));
+          }
+          on_event(notification);
+        } catch (const std::exception& error) {
+          callback_error = error.what();
+        }
+      });
+
+  info.rejected_fields =
+      CollectRejectedSelectClauses(result.filterResult(), fields);
+  const opcua::StatusCode item_status = result.statusCode();
+  if (item_status.isBad()) {
+    // The pre-flight finding is reported here too: on this path on_ready never
+    // runs, and "the filter was refused" plus "this node raises no events
+    // anyway" are different problems the user should not have to rediscover.
+    std::string message = ExplainEventSubscribeFailure(
+        node_id_text, item_status, info.rejected_fields);
+    if (!info.warning.empty()) {
+      message += "\n  Note: " + info.warning;
+    }
+    throw std::runtime_error(message);
+  }
+
+  info.subscription_id = subscription_id;
+  info.monitored_item_id = result.monitoredItemId();
+  info.publishing_interval_ms = subscription.revisedPublishingInterval();
+  on_ready(info);
+
+  // Same self-termination contract as `watch`: --duration is wall-clock
+  // seconds, --count is an event count, whichever is reached first ends the
+  // run, and without either it runs until interrupted. Neither is --timeout,
+  // which is the connect/request timeout.
+  using Clock = std::chrono::steady_clock;
+  std::optional<Clock::time_point> deadline;
+  if (duration_seconds) {
+    deadline =
+        Clock::now() + std::chrono::duration_cast<Clock::duration>(
+                           std::chrono::duration<double>(*duration_seconds));
+  }
+  // Iterate in short slices rather than one long network wait, so --duration
+  // and --count take effect promptly instead of only when a publish arrives.
+  constexpr std::int64_t kSliceMs = 100;
+  while (callback_error.empty() && (!count || received < *count)) {
+    std::int64_t slice = kSliceMs;
+    if (deadline) {
+      const auto remaining =
+          std::chrono::duration_cast<std::chrono::milliseconds>(*deadline -
+                                                                Clock::now())
+              .count();
+      if (remaining <= 0) {
+        break;
+      }
+      slice = std::min(remaining, kSliceMs);
+    }
+    client.runIterate(static_cast<std::uint16_t>(slice));
+  }
+
+  if (!callback_error.empty()) {
+    throw std::runtime_error(callback_error);
+  }
+}
 
 NodesetDump OpcuaClient::DumpNodeset(const std::string& root_node,
                                      std::optional<int> namespace_filter,
@@ -834,8 +1180,8 @@ NodesetDump OpcuaClient::DumpNodeset(const std::string& root_node,
 
     const bool in_scope =
         !namespace_filter ||
-        id.namespaceIndex() == static_cast<opcua::NamespaceIndex>(
-                                   *namespace_filter);
+        id.namespaceIndex() ==
+            static_cast<opcua::NamespaceIndex>(*namespace_filter);
     if (in_scope) {
       dump.nodes.push_back(std::move(node));
     }

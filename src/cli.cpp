@@ -5,6 +5,7 @@
 #include <boost/json.hpp>
 
 #include <chrono>
+#include <cstdint>
 #include <exception>
 #include <iostream>
 #include <map>
@@ -33,6 +34,8 @@ void PrintUsage() {
       << "  endpoints ENDPOINT\n"
       << "  watch ENDPOINT NODEID [--interval=MS] [--duration=SECONDS] "
          "[--count=N]\n"
+      << "  events ENDPOINT [NODEID|i=2253] [--duration=SECONDS] [--count=N] "
+         "[--select=FIELD,...]\n"
       << "  generate:nodeset FILE [--output=generated] "
          "[--namespace=Generated::OpcUa]\n"
       << "  dump:nodeset ENDPOINT --output=FILE [--namespace=N] "
@@ -109,6 +112,24 @@ std::string GetOption(const ParsedArgs& args,
                       const std::string& fallback = "") {
   auto it = args.options.find(name);
   return it == args.options.end() ? fallback : it->second;
+}
+
+// Self-termination limits shared by `watch` and `events`: --duration is
+// wall-clock seconds and --count is a sample/event count, whichever is reached
+// first ends the run, and with neither it runs until interrupted. Deliberately
+// separate from --timeout, which is the connect/request timeout.
+std::optional<double> ParseDuration(const ParsedArgs& args) {
+  auto it = args.options.find("duration");
+  return it == args.options.end()
+             ? std::nullopt
+             : std::optional<double>(std::stod(it->second));
+}
+
+std::optional<std::uint64_t> ParseCount(const ParsedArgs& args) {
+  auto it = args.options.find("count");
+  return it == args.options.end()
+             ? std::nullopt
+             : std::optional<std::uint64_t>(std::stoull(it->second));
 }
 
 void RequirePositionals(const ParsedArgs& args, std::size_t count) {
@@ -209,6 +230,79 @@ void PrintRead(const ReadResult& result) {
     std::cout << "Server:     " << result.server_timestamp << "\n";
   if (!result.hint.empty())
     std::cout << "Hint:       " << result.hint << "\n";
+}
+
+// Splits a comma-separated option value ("EventId,Message") into its entries.
+std::vector<std::string> SplitList(const std::string& value) {
+  std::vector<std::string> entries;
+  std::size_t start = 0;
+  while (true) {
+    const auto comma = value.find(',', start);
+    std::string entry = value.substr(
+        start, comma == std::string::npos ? std::string::npos : comma - start);
+    if (!entry.empty()) {
+      entries.push_back(std::move(entry));
+    }
+    if (comma == std::string::npos) {
+      return entries;
+    }
+    start = comma + 1;
+  }
+}
+
+// Event lines are space-separated Name=Value pairs, so a value carrying a
+// space (a Message, typically) is quoted and escaped to keep the pairs
+// separable. Hex EventIds and NodeIds never trip this.
+std::string QuoteIfNeeded(const std::string& value) {
+  if (value.find_first_of(" \t\n\"\\") == std::string::npos) {
+    return value;
+  }
+  std::string out = "\"";
+  for (const char character : value) {
+    switch (character) {
+      case '"':
+      case '\\':
+        out += '\\';
+        out += character;
+        break;
+      case '\n':
+        out += "\\n";
+        break;
+      case '\t':
+        out += "\\t";
+        break;
+      default:
+        out += character;
+    }
+  }
+  return out + "\"";
+}
+
+void PrintEvent(const EventNotification& event) {
+  std::string line;
+  for (const auto& field : event.fields) {
+    if (!line.empty()) {
+      line += ' ';
+    }
+    line += field.name + "=" + QuoteIfNeeded(field.value);
+  }
+  // Flush per event: with stdout on a pipe the stream is block-buffered, and a
+  // long subscription would otherwise show nothing for minutes.
+  std::cout << line << std::endl;
+}
+
+boost::json::object EventToJson(const EventNotification& event) {
+  boost::json::object fields;
+  for (const auto& field : event.fields) {
+    // Typed: numbers stay numbers, and a field the server sent with no value
+    // is JSON null rather than an empty string, so `jq 'select(.Fields.EventId
+    // == null)'` finds exactly the events this command exists to catch.
+    fields[field.name] = field.json_value;
+  }
+  return {
+      {"Seq", event.sequence},
+      {"Fields", std::move(fields)},
+  };
 }
 
 void PrintEndpoints(const std::vector<EndpointInfo>& endpoints) {
@@ -338,22 +432,13 @@ int main(int argc, char** argv) {
       RequirePositionals(args, 2);
       const auto interval = std::chrono::milliseconds(
           std::stoull(GetOption(args, "interval", "1000")));
-      // Self-termination limits. --duration is wall-clock seconds and --count
-      // is a sample count; whichever is reached first ends the watch, and
-      // without either it runs until interrupted, as before. Deliberately
-      // separate from --timeout, which is the connect/request timeout.
       using Clock = std::chrono::steady_clock;
       std::optional<Clock::time_point> deadline;
-      if (args.options.count("duration")) {
-        const std::chrono::duration<double> seconds(
-            std::stod(args.options["duration"]));
+      if (const auto seconds = ParseDuration(args)) {
         deadline = Clock::now() + std::chrono::duration_cast<Clock::duration>(
-                                      seconds);
+                                      std::chrono::duration<double>(*seconds));
       }
-      std::optional<std::uint64_t> count;
-      if (args.options.count("count")) {
-        count = std::stoull(args.options["count"]);
-      }
+      const std::optional<std::uint64_t> count = ParseCount(args);
 
       for (std::uint64_t taken = 0; !count || taken < *count; ++taken) {
         auto result = client.Read(args.positionals[1], "Value");
@@ -372,6 +457,41 @@ int main(int argc, char** argv) {
         }
         std::this_thread::sleep_until(next);
       }
+    } else if (args.command == "events") {
+      // The Server object is an event notifier on every server, so it is the
+      // one node this command can default to and still be useful.
+      const std::string node =
+          args.positionals.size() > 1 ? args.positionals[1] : "i=2253";
+      const std::vector<std::string> fields =
+          args.options.count("select") ? SplitList(args.options["select"])
+                                       : DefaultEventFields();
+
+      client.SubscribeEvents(
+          node, fields, ParseDuration(args), ParseCount(args),
+          [&](const EventSubscriptionInfo& info) {
+            // Everything about the subscription itself goes to stderr: stdout
+            // is the stream of events and nothing else, so a pipe stays
+            // parseable.
+            if (!info.warning.empty()) {
+              std::cerr << "warning: " << info.warning << "\n";
+            }
+            for (const auto& rejected : info.rejected_fields) {
+              std::cerr << "warning: server rejected select clause " << rejected
+                        << " — that field arrives null on every event\n";
+            }
+            std::cerr << "subscribed to events on " << node << " (subscription "
+                      << info.subscription_id << ", item "
+                      << info.monitored_item_id << ", publishing every "
+                      << info.publishing_interval_ms << " ms)\n";
+          },
+          [&](const EventNotification& event) {
+            if (args.json) {
+              std::cout << boost::json::serialize(EventToJson(event))
+                        << std::endl;
+            } else {
+              PrintEvent(event);
+            }
+          });
     } else {
       throw std::runtime_error("Unknown command: " + args.command);
     }

@@ -46,6 +46,7 @@ opcua-cli read opc.tcp://localhost:4840 NODEID [--attribute=Value] [--json]
 opcua-cli write opc.tcp://localhost:4840 NODEID VALUE [--type=Int32] [--json]
 opcua-cli endpoints opc.tcp://localhost:4840 [--json]
 opcua-cli watch opc.tcp://localhost:4840 NODEID [--interval=250] [--duration=SECONDS] [--count=N] [--json]
+opcua-cli events opc.tcp://localhost:4840 [NODEID] [--duration=SECONDS] [--count=N] [--select=FIELD,...] [--json]
 opcua-cli generate:nodeset path/to/NodeSet2.xml [--output=generated] [--namespace=Generated::OpcUa]
 opcua-cli dump:nodeset opc.tcp://localhost:4840 --output=Server.NodeSet2.xml [--namespace=N] [--root=NODEID] [--max-nodes=N] [--values]
 ```
@@ -62,6 +63,50 @@ is the connect/request timeout and is unrelated.
 opcua-cli watch opc.tcp://localhost:4840 ns=2;i=41 --interval=250 --count=10
 # whatever arrives in the next 30 seconds, as JSON lines
 opcua-cli watch opc.tcp://localhost:4840 ns=2;i=41 --duration=30 --json
+```
+
+`events` subscribes to a node's **events** rather than to a value: it creates a
+subscription and a monitored item on the `EventNotifier` attribute with an
+`EventFilter`, and prints one line per event, flushed per event. `NODEID`
+defaults to `i=2253`, the Server object, which every server exposes as an event
+notifier. `--duration` and `--count` bound the run exactly as they do for
+`watch`.
+
+The default select clauses are the `BaseEventType` fields every conforming
+server defines — `EventId`, `EventType`, `SourceNode`, `SourceName`, `Time`,
+`ReceiveTime`, `Message`, `Severity`
+([OPC UA Part 5 §6.4.2](https://reference.opcfoundation.org/Core/Part5/v105/docs/6.4.2)).
+`--select` replaces that list. A field is a browse path below `BaseEventType`:
+`Message`, a namespace-qualified `2:VendorCode`, or a nested `2:Vendor/Code`.
+
+```sh
+# the next five events on the Server object
+opcua-cli events opc.tcp://localhost:4840 --count=5
+# just the identity fields, for 30 seconds, as JSON lines
+opcua-cli events opc.tcp://localhost:4840 i=2253 --duration=30 --select=EventId,SourceNode,Time --json
+```
+
+Human output is space-separated `Name=Value` pairs in the order requested; a
+value containing whitespace or a quote is quoted and escaped so the pairs stay
+separable. Under `--json` each event is one object, `{"Seq":N,"Fields":{…}}`,
+with typed field values.
+
+```
+$ opcua-cli events opc.tcp://localhost:4840 --count=1
+EventId=43db88e4d97e57bf53220cac05523184 EventType=i=2041 SourceNode=i=2253 SourceName=Server Time=2026-08-01T16:37:54Z ReceiveTime=2026-08-01T16:37:54Z Message="test event" Severity=500
+```
+
+Everything about the subscription itself — the confirmation line, a node that
+reports no `EventNotifier`, select clauses the server accepted the item with but
+answered Bad for — goes to **stderr**, so stdout stays a clean stream of events.
+A rejected subscription is an error with a `Hint` naming the cause, and exits
+nonzero:
+
+```
+$ opcua-cli events opc.tcp://localhost:4840 i=85
+error: Event subscription on i=85 rejected: BadNotSupported (0x803D0000)
+  Hint: this node has no EventNotifier attribute, so it raises no events — the server rejected the request, the connection is fine.
+  Every server exposes the Server object i=2253 as an event notifier; try that, or browse for a node whose EventNotifier has the SubscribeToEvents bit set.
 ```
 
 `dump:nodeset` crawls the server's address space breadth-first from `--root`
@@ -158,6 +203,15 @@ opcua-cli read opc.tcp://localhost:4840 i=2255
 - NodeIds are printed in canonical form (`i=2253`, `ns=2;i=1001`) in every
   command and in `--json`, so they can be pasted straight into another
   invocation.
+- ByteStrings — an `EventId` above all — are rendered as lowercase hex, cut at
+  64 bytes with the true length appended. **A missing one stays visible.** A
+  field the server sent with no value at all reads `<null>` (JSON `null`) and a
+  zero-length ByteString reads `<empty>`, in both cases distinct from an
+  ordinary value and never blanked out. OPC UA Part 5 §6.4.2 makes `EventId`
+  mandatory on every event, so an event arriving without one is a server or
+  proxy defect, and `events` exists in large part to make that defect
+  observable — `events … --json | jq 'select(.Fields.EventId == null)'` is the
+  intended way to catch it.
 - `read` explains status codes that look like tool failures but are the
   server's correct answer. `--attribute=Value` on an Object node returns
   `BadAttributeIdInvalid`; the CLI adds a `Hint` line naming the node class and

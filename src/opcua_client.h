@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -67,6 +68,47 @@ struct WriteResult {
   bool bad = false;
 };
 
+// One select clause of an event notification, answered by the server.
+struct EventField {
+  // The field as requested on the command line: "EventId", "2:Vendor/Code".
+  std::string name;
+  // Human rendering, never empty. A field the server sent with no value at all
+  // renders "<null>" and a zero-length ByteString renders "<empty>", because
+  // an EventId that arrives absent is the defect this command exists to
+  // surface — OPC UA Part 5 §6.4.2 makes EventId mandatory on every event, so
+  // an invisible rendering would hide a real server bug.
+  std::string value;
+  // Typed rendering for --json; JSON null when the field carried no value.
+  boost::json::value json_value;
+  // OPC UA data type name of the field, "Null" when it carried no value.
+  std::string type;
+};
+
+struct EventNotification {
+  // 1-based arrival order within this run.
+  std::uint64_t sequence = 0;
+  // One entry per select clause, in the order requested. A server that returns
+  // fewer fields than clauses has the missing ones filled in as null.
+  std::vector<EventField> fields;
+};
+
+// What the server made of the subscription request, reported once the
+// monitored item exists and before any event arrives.
+struct EventSubscriptionInfo {
+  std::uint32_t subscription_id = 0;
+  std::uint32_t monitored_item_id = 0;
+  double publishing_interval_ms = 0.0;
+  // Select clauses the server accepted the item with but answered Bad for, as
+  // "FieldName: status". Those fields arrive null on every event, which must
+  // not be mistaken for the server reporting a null value.
+  std::vector<std::string> rejected_fields;
+  // Set when the node's own EventNotifier attribute says it raises no events.
+  // A warning rather than an error: the authoritative answer is the server's
+  // CreateMonitoredItems status, and a server that misreports its own
+  // attribute may still deliver.
+  std::string warning;
+};
+
 struct EndpointInfo {
   std::string endpoint_url;
   std::string security_policy;
@@ -97,6 +139,21 @@ class OpcuaClient {
                                std::uint64_t interval_ms,
                                bool once);
 
+  // Creates a subscription and a monitored item on node_id's EventNotifier
+  // attribute, filtered by an EventFilter whose select clauses are `fields`
+  // (browse paths below BaseEventType). Calls on_ready once the server has
+  // accepted the item, then on_event for each event that arrives, and returns
+  // when `count` events have been received or `duration_seconds` of wall-clock
+  // have elapsed — with neither it runs until interrupted. The subscription is
+  // deleted before returning.
+  void SubscribeEvents(
+      const std::string& node_id,
+      const std::vector<std::string>& fields,
+      std::optional<double> duration_seconds,
+      std::optional<std::uint64_t> count,
+      const std::function<void(const EventSubscriptionInfo&)>& on_ready,
+      const std::function<void(const EventNotification&)>& on_event);
+
   // Crawls the address space breadth-first from root_node, following forward
   // references, and returns the captured nodes plus the server namespace
   // array. When namespace_filter is set, only nodes in that namespace index
@@ -116,5 +173,10 @@ class OpcuaClient {
 };
 
 std::string StatusToString(std::uint32_t status_code);
+
+// The BaseEventType fields every conforming server defines, in the order OPC
+// UA Part 5 §6.4.2 lists them:
+// https://reference.opcfoundation.org/Core/Part5/v105/docs/6.4.2
+std::vector<std::string> DefaultEventFields();
 
 #endif  // SRC_OPCUA_CLIENT_H_
