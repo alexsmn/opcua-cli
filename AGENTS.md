@@ -6,7 +6,8 @@ Guidance for coding agents working in this repository.
 
 `opcua-cli` is a C++23 OPC UA **diagnostic client** — a command-line tool for
 poking at a live OPC UA server: browse the address space, read and write
-attributes, watch a value change, dump the address space to a UANodeSet XML.
+attributes, watch a value change, subscribe to a node's events, dump the
+address space to a UANodeSet XML.
 
 It is a port of the `php-opcua/opcua-cli` v4.4.x command surface (upstream docs:
 https://www.php-opcua.com/documentation/opcua-cli/v4.4.x), built on
@@ -67,7 +68,18 @@ These are load-bearing, and scripts depend on them:
   with typed elements, not strings. Never reintroduce a placeholder like the
   old `"<array>"`.
 - `watch` prints exactly **one line per sample** and flushes each tick, so it
-  stays useful through a pipe.
+  stays useful through a pipe. `events` does the same per event, and puts
+  *everything* about the subscription itself — the confirmation line, the
+  EventNotifier warning, rejected select clauses — on stderr, so stdout stays a
+  clean stream of events.
+- **A missing EventId must stay visible.** A field the server sent with no
+  value renders `<null>` (JSON `null`), a zero-length ByteString `<empty>`, and
+  the two stay distinct. Never blank, normalise or pretty-print either away.
+  This is not cosmetic: `events` exists because an aggregating proxy projected
+  a payload-less status notification onto the wire as a field list of nulls,
+  which the far side reassembled into a phantom event with a zero/null
+  EventId — and OPC UA Part 5 §6.4.2 makes EventId mandatory on every event,
+  so an event without one is always a defect worth surfacing.
 - NodeIds are rendered in canonical form (`i=2253`, `ns=2;i=1001`) everywhere,
   never with the quotes `opcua::toString` adds. Use `FormatNodeId`.
 - `write` exits nonzero when the server answers with a Bad status.
@@ -100,12 +112,46 @@ V=build/vcpkg-make/vcpkg_installed/arm64-osx
 c++ -std=c++23 -I$V/include server.cpp -o server $V/lib/libopen62541pp.a $V/lib/libopen62541.a
 ```
 
+To exercise `events`, give that server something to raise — drive it with
+`runIterate()` in a loop instead of `run()` and trigger on a timer:
+
+```cpp
+opcua::Event event(server);
+event.writeSourceName("TestSource").writeTime(opcua::DateTime::now())
+     .writeSeverity(100).writeMessage({"en-US", "test event"});
+event.trigger();  // origin defaults to ObjectId::Server, i.e. i=2253
+```
+
+Two things that will otherwise cost an hour:
+
+- **You cannot make open62541 emit a null EventId.** `triggerEvent` always
+  generates one and writes it over whatever you set, so the `<null>` path
+  cannot be reproduced from the server side. Exercise it through `LocalTime`
+  instead: it is optional on BaseEventType, so the select clause resolves but
+  the instance has no value and the field arrives null. `<empty>` is reachable
+  through a plain ByteString variable holding a zero-length value. The
+  rendering is field-name agnostic, so both prove the EventId path.
+- **Do not raise `outStandingPublishRequests` back to open62541's default of
+  ten.** Closing the session deletes subscriptions, so every queued publish
+  request returns BadNoSubscription and the client logs a warning for each —
+  ten lines of noise on the stderr channel `events` uses for real problems.
+  One request in flight loses nothing: the server queues notifications and
+  answers a whole burst in one response.
+
 Useful checks against any live server, since they exist on every one:
 `i=2255` (NamespaceArray — an array read), `i=2254` (ServerArray), `i=85`
-(Objects folder — an Object node, so `--attribute=Value` correctly fails).
+(Objects folder — an Object node, so `--attribute=Value` correctly fails, and
+a non-notifier, so `events` on it correctly fails too).
 
-macOS has **no `timeout(1)`**; do not lean on it to bound a run. `watch` has
-`--duration` and `--count` for exactly this reason.
+Servers disagree about the EventNotifier attribute, so the pre-flight check in
+`CheckEventNotifier` **warns and continues rather than failing**. The SCADA
+aggregating proxy answers `BadAttributeIdInvalid` for EventNotifier on `i=2253`
+and then delivers events perfectly well; hard-failing on that reading would
+block a working subscription. The authoritative answer is the server's
+CreateMonitoredItems status.
+
+macOS has **no `timeout(1)`**; do not lean on it to bound a run. `watch` and
+`events` have `--duration` and `--count` for exactly this reason.
 
 ## Docs
 
