@@ -32,6 +32,7 @@ void PrintUsage() {
       << "  read ENDPOINT NODEID [--attribute=Value]\n"
       << "  write ENDPOINT NODEID VALUE [--type=Int32]\n"
       << "  endpoints ENDPOINT\n"
+      << "  subscribe ENDPOINT NODEID[,NODEID...] [--duration=SECONDS]\n"
       << "  watch ENDPOINT NODEID [--interval=MS] [--duration=SECONDS] "
          "[--count=N]\n"
       << "  events ENDPOINT [NODEID|i=2253] [--duration=SECONDS] [--count=N] "
@@ -510,6 +511,64 @@ int main(int argc, char** argv) {
           break;
         }
         std::this_thread::sleep_until(next);
+      }
+    } else if (args.command == "subscribe") {
+      // One subscription, many items, per-item delivery counts.
+      //
+      // `watch` cannot answer this: it polls Read and never subscribes, so it
+      // reports that a node is readable, not that the server publishes it. A
+      // node can also be delivered fine on a subscription of its own and
+      // starved when it shares one, which is why every node here goes on the
+      // SAME subscription.
+      RequirePositionals(args, 2);
+      const std::vector<std::string> nodes = SplitList(args.positionals[1]);
+      std::vector<std::uint64_t> counts;
+      std::vector<double> last_seen;
+      std::vector<char> server_deleted;
+      client.SubscribeValues(
+          nodes, ParseDuration(args),
+          [&](std::uint32_t subscription_id,
+              const std::vector<std::uint32_t>& item_ids,
+              const std::vector<std::string>& item_errors) {
+            if (args.json) {
+              return;
+            }
+            std::cout << "Subscription: " << subscription_id << "\n";
+            for (std::size_t i = 0; i < nodes.size(); ++i) {
+              std::cout << "  " << nodes[i] << "  item="
+                        << (item_errors[i].empty()
+                                ? std::to_string(item_ids[i])
+                                : ("REFUSED " + item_errors[i]))
+                        << "\n";
+            }
+            std::cout << "Collecting..." << std::endl;
+          },
+          counts, last_seen, server_deleted);
+
+      if (args.json) {
+        boost::json::array rows;
+        for (std::size_t i = 0; i < nodes.size(); ++i) {
+          rows.push_back(boost::json::object{
+              {"node", nodes[i]},
+              {"count", counts[i]},
+              {"last_seen_s", last_seen[i]},
+              {"server_deleted", server_deleted[i] != 0}});
+        }
+        std::cout << boost::json::serialize(rows) << std::endl;
+      } else {
+        for (std::size_t i = 0; i < nodes.size(); ++i) {
+          std::cout << nodes[i] << "  count=" << counts[i];
+          if (last_seen[i] < 0) {
+            std::cout << "  last=never";
+          } else {
+            std::cout << "  last=" << last_seen[i] << "s";
+          }
+          if (server_deleted[i]) {
+            std::cout << "  SERVER-DELETED";
+          }
+          std::cout << "\n";
+        }
+        std::cout << std::flush;
       }
     } else if (args.command == "events") {
       // The Server object is an event notifier on every server, so it is the

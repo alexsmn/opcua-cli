@@ -176,6 +176,29 @@ class OpcuaClient {
       const std::function<void(const EventSubscriptionInfo&)>& on_ready,
       const std::function<void(const EventNotification&)>& on_event);
 
+  // Subscribes to the Value attribute of EVERY node in `node_ids` on ONE
+  // subscription, and reports how many data changes each item received.
+  //
+  // Deliberately one subscription rather than one per node: a server can
+  // deliver a node perfectly on its own subscription and still starve it when
+  // it shares one with others, and that difference is invisible to `watch`,
+  // which polls Read and never subscribes at all. `counts[i]` corresponds to
+  // `node_ids[i]`; an entry that stays 0, or stops rising while its peers keep
+  // going, is the observation this exists to make.
+  void SubscribeValues(
+      const std::vector<std::string>& node_ids,
+      std::optional<double> duration_seconds,
+      const std::function<void(std::uint32_t subscription_id,
+                               const std::vector<std::uint32_t>& item_ids,
+                               const std::vector<std::string>& item_errors)>&
+          on_ready,
+      std::vector<std::uint64_t>& counts,
+      std::vector<double>& last_seen_seconds,
+      // Set when the SERVER deleted the monitored item out from under us. That
+      // is one concrete way a single item can stop while its peers continue,
+      // and it is otherwise invisible: deliveries simply cease.
+      std::vector<char>& server_deleted);
+
   // Crawls the address space breadth-first from root_node, following forward
   // references, and returns the captured nodes plus the server namespace
   // array. When namespace_filter is set, only nodes in that namespace index

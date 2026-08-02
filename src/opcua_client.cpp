@@ -1146,6 +1146,97 @@ void OpcuaClient::SubscribeEvents(
   }
 }
 
+void OpcuaClient::SubscribeValues(
+    const std::vector<std::string>& node_ids,
+    std::optional<double> duration_seconds,
+    const std::function<void(std::uint32_t,
+                             const std::vector<std::uint32_t>&,
+                             const std::vector<std::string>&)>& on_ready,
+    std::vector<std::uint64_t>& counts,
+    std::vector<double>& last_seen_seconds,
+    std::vector<char>& server_deleted) {
+  opcua::Client& client = *impl_->client;
+
+  const auto subscription = opcua::services::createSubscription(
+      client, opcua::SubscriptionParameters{}, true, {}, {});
+  const opcua::StatusCode subscription_status =
+      subscription.responseHeader().serviceResult();
+  if (subscription_status.isBad()) {
+    throw std::runtime_error("CreateSubscription failed: " +
+                             StatusToString(subscription_status));
+  }
+  const opcua::IntegerId subscription_id = subscription.subscriptionId();
+
+  // Delete the subscription on every exit path, so an interrupted run does not
+  // leave the server publishing into nothing.
+  struct Guard {
+    opcua::Client& client;
+    opcua::IntegerId id;
+    ~Guard() { opcua::services::deleteSubscription(client, id); }
+  } guard{client, subscription_id};
+
+  using Clock = std::chrono::steady_clock;
+  const auto started = Clock::now();
+
+  counts.assign(node_ids.size(), 0);
+  last_seen_seconds.assign(node_ids.size(), -1.0);
+  server_deleted.assign(node_ids.size(), 0);
+  std::vector<std::uint32_t> item_ids(node_ids.size(), 0);
+  std::vector<std::string> item_errors(node_ids.size());
+
+  for (std::size_t i = 0; i < node_ids.size(); ++i) {
+    opcua::MonitoringParametersEx parameters;
+    // Ask for the server's fastest practical rate; the default 250 ms would
+    // blur a stall that starts within a second or two.
+    parameters.samplingInterval = 0.0;
+    parameters.queueSize = 100;
+    const auto result = opcua::services::createMonitoredItemDataChange(
+        client, subscription_id,
+        {ParseNodeId(node_ids[i]), opcua::AttributeId::Value},
+        opcua::MonitoringMode::Reporting, parameters,
+        [&counts, &last_seen_seconds, i, started](
+            opcua::IntegerId, opcua::IntegerId, const opcua::DataValue&) {
+          // Runs inside open62541's C callback: keep it to arithmetic, since an
+          // exception here would unwind through C frames.
+          ++counts[i];
+          last_seen_seconds[i] =
+              std::chrono::duration<double>(Clock::now() - started).count();
+        },
+        [&server_deleted, i](opcua::IntegerId, opcua::IntegerId) {
+          server_deleted[i] = 1;
+        });
+    const opcua::StatusCode item_status = result.statusCode();
+    if (item_status.isBad()) {
+      item_errors[i] = StatusToString(item_status);
+    } else {
+      item_ids[i] = result.monitoredItemId();
+    }
+  }
+
+  on_ready(subscription_id, item_ids, item_errors);
+
+  std::optional<Clock::time_point> deadline;
+  if (duration_seconds) {
+    deadline = started + std::chrono::duration_cast<Clock::duration>(
+                             std::chrono::duration<double>(*duration_seconds));
+  }
+  constexpr std::int64_t kSliceMs = 100;
+  for (;;) {
+    std::int64_t slice = kSliceMs;
+    if (deadline) {
+      const auto remaining =
+          std::chrono::duration_cast<std::chrono::milliseconds>(*deadline -
+                                                                Clock::now())
+              .count();
+      if (remaining <= 0) {
+        break;
+      }
+      slice = std::min(remaining, kSliceMs);
+    }
+    client.runIterate(static_cast<std::uint16_t>(slice));
+  }
+}
+
 NodesetDump OpcuaClient::DumpNodeset(const std::string& root_node,
                                      std::optional<int> namespace_filter,
                                      std::size_t max_nodes,
