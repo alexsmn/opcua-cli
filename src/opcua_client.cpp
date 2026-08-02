@@ -243,7 +243,62 @@ bool VisitVariantElement(const opcua::Variant& variant,
          dispatch.template operator()<opcua::QualifiedName>() ||
          dispatch.template operator()<opcua::NodeId>() ||
          dispatch.template operator()<opcua::DateTime>() ||
-         dispatch.template operator()<opcua::StatusCode>();
+         dispatch.template operator()<opcua::StatusCode>() ||
+         // A structure rather than a builtin, listed here because the
+         // RolePermissions / UserRolePermissions attributes carry nothing else
+         // and rendering them as "<RolePermissionType>" would make those
+         // attributes readable but not legible.
+         dispatch.template operator()<UA_RolePermissionType>();
+}
+
+// The PermissionType bits set in `permissions`, joined with '|'
+// (OPC UA Part 3 §8.55). Named rather than numeric: the point of reading a
+// RolePermissions attribute is to see what a Role may do, and 69729 does not
+// say that.
+// https://reference.opcfoundation.org/Core/Part3/v105/docs/8.55
+std::string PermissionBitsToString(UA_UInt32 permissions) {
+  static constexpr std::pair<UA_UInt32, std::string_view> kBits[] = {
+      {UA_PERMISSIONTYPE_BROWSE, "Browse"},
+      {UA_PERMISSIONTYPE_READROLEPERMISSIONS, "ReadRolePermissions"},
+      {UA_PERMISSIONTYPE_WRITEATTRIBUTE, "WriteAttribute"},
+      {UA_PERMISSIONTYPE_WRITEROLEPERMISSIONS, "WriteRolePermissions"},
+      {UA_PERMISSIONTYPE_WRITEHISTORIZING, "WriteHistorizing"},
+      {UA_PERMISSIONTYPE_READ, "Read"},
+      {UA_PERMISSIONTYPE_WRITE, "Write"},
+      {UA_PERMISSIONTYPE_READHISTORY, "ReadHistory"},
+      {UA_PERMISSIONTYPE_INSERTHISTORY, "InsertHistory"},
+      {UA_PERMISSIONTYPE_MODIFYHISTORY, "ModifyHistory"},
+      {UA_PERMISSIONTYPE_DELETEHISTORY, "DeleteHistory"},
+      {UA_PERMISSIONTYPE_RECEIVEEVENTS, "ReceiveEvents"},
+      {UA_PERMISSIONTYPE_CALL, "Call"},
+      {UA_PERMISSIONTYPE_ADDREFERENCE, "AddReference"},
+      {UA_PERMISSIONTYPE_REMOVEREFERENCE, "RemoveReference"},
+      {UA_PERMISSIONTYPE_DELETENODE, "DeleteNode"},
+      {UA_PERMISSIONTYPE_ADDNODE, "AddNode"},
+  };
+
+  std::string out;
+  UA_UInt32 recognised = 0;
+  for (const auto& [bit, name] : kBits) {
+    if ((permissions & bit) != 0) {
+      if (!out.empty()) {
+        out += '|';
+      }
+      out += name;
+      recognised |= bit;
+    }
+  }
+  // Anything outside the seventeen defined bits is reported rather than
+  // dropped: a server setting one is saying something this build does not
+  // understand, and silently showing the bits it does recognise would misstate
+  // the grant as smaller than it is.
+  if (const UA_UInt32 unknown = permissions & ~recognised; unknown != 0) {
+    if (!out.empty()) {
+      out += '|';
+    }
+    out += "0x" + std::format("{:x}", unknown);
+  }
+  return out.empty() ? "None" : out;
 }
 
 std::string DateTimeToString(opcua::DateTime value);
@@ -313,6 +368,12 @@ std::string ElementToString(const opcua::Variant& variant, std::size_t index) {
           out = DateTimeToString(element);
         } else if constexpr (std::is_same_v<T, opcua::StatusCode>) {
           out = StatusToString(element);
+        } else if constexpr (std::is_same_v<T, UA_RolePermissionType>) {
+          // "i=15680=Browse|Read|Write|Call" — the Role, then what it may do.
+          // The role id keeps the canonical text form so it can be pasted into
+          // another invocation to read the Role node itself.
+          out = FormatNodeId(opcua::NodeId{element.roleId}) + "=" +
+                PermissionBitsToString(element.permissions);
         } else if constexpr (std::is_floating_point_v<T>) {
           out = FloatToString(element);
         } else {
