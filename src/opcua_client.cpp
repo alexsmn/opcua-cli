@@ -178,6 +178,24 @@ opcua::AttributeId AttributeId(const std::string& name) {
     return opcua::AttributeId::Description;
   if (name == "AccessLevel")
     return opcua::AttributeId::AccessLevel;
+  // The caller-specific narrowing of AccessLevel (OPC UA Part 3 §5.6.2). Worth
+  // having beside AccessLevel: the difference between the two is exactly what
+  // this session may not do, which is otherwise only visible by trying it.
+  if (name == "UserAccessLevel")
+    return opcua::AttributeId::UserAccessLevel;
+  if (name == "Executable")
+    return opcua::AttributeId::Executable;
+  if (name == "UserExecutable")
+    return opcua::AttributeId::UserExecutable;
+  // What each Role is granted on this node, and the subset the caller's own
+  // Roles give it (OPC UA Part 3 §5.2.9/§5.2.10). Reading RolePermissions off a
+  // node carrying no per-node override is how you see a server's DEFAULT
+  // role -> permission map -- the spec models grants per node and per
+  // namespace, never on RoleType, so there is no other place to ask.
+  if (name == "RolePermissions")
+    return opcua::AttributeId::RolePermissions;
+  if (name == "UserRolePermissions")
+    return opcua::AttributeId::UserRolePermissions;
   if (name == "EventNotifier")
     return opcua::AttributeId::EventNotifier;
   if (name == "NodeId")
