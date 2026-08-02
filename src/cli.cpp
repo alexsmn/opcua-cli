@@ -30,6 +30,8 @@ void PrintUsage() {
       << "Commands:\n"
       << "  browse ENDPOINT [NODEID|/Objects] [--recursive] [--depth=N]\n"
       << "  read ENDPOINT NODEID [--attribute=Value]\n"
+      << "       [--span-context=TRACEID:SPANID] [--traceparent=VALUE] "
+         "[--dump-header]\n"
       << "  write ENDPOINT NODEID VALUE [--type=Int32]\n"
       << "  endpoints ENDPOINT\n"
       << "  subscribe ENDPOINT NODEID[,NODEID...] [--duration=SECONDS]\n"
@@ -325,6 +327,41 @@ boost::json::object EventToJson(const EventNotification& event) {
   };
 }
 
+// Builds the trace context a `read` should carry from its flags.
+//
+// `--span-context=TRACEID:SPANID` is the OPC UA Part 26 §5.6.4 entry; either
+// half may be left empty, which sends the all-zero value for it. That is not a
+// convenience — a null TraceId and a zero SpanId are precisely the values
+// Part 26 leaves meaningless, so being able to send one on its own is how a
+// server's handling of them gets tested.
+//
+// `--traceparent=VALUE` adds the W3C entry alongside. Both together is legal
+// (OPC UA Part 4 §7.33 makes the slot a list) and is its own test case.
+TraceContext ParseTraceContext(const ParsedArgs& args) {
+  TraceContext trace;
+  if (args.options.count("traceparent") > 0) {
+    trace.traceparent = GetOption(args, "traceparent");
+  }
+  if (args.options.count("span-context") > 0) {
+    const std::string value = GetOption(args, "span-context");
+    const auto colon = value.find(':');
+    if (colon == std::string::npos) {
+      throw std::runtime_error(
+          "--span-context expects TRACEID:SPANID (either side may be empty)");
+    }
+    trace.span_trace_id = value.substr(0, colon);
+    trace.span_id = value.substr(colon + 1);
+    if (trace.span_trace_id->empty())
+      trace.span_trace_id.reset();
+    if (trace.span_id->empty())
+      trace.span_id.reset();
+    if (!trace.span_trace_id.has_value() && !trace.span_id.has_value()) {
+      throw std::runtime_error("--span-context needs at least one of the two");
+    }
+  }
+  return trace;
+}
+
 void PrintEndpoints(const std::vector<EndpointInfo>& endpoints) {
   for (const auto& endpoint : endpoints) {
     std::cout << "Endpoint: " << endpoint.endpoint_url << "\n"
@@ -461,8 +498,27 @@ int main(int argc, char** argv) {
       }
     } else if (args.command == "read") {
       RequirePositionals(args, 2);
-      auto result = client.Read(args.positionals[1],
-                                GetOption(args, "attribute", "Value"));
+      const TraceContext trace = ParseTraceContext(args);
+      ReadResult result;
+      if (trace.empty()) {
+        result = client.Read(args.positionals[1],
+                             GetOption(args, "attribute", "Value"));
+      } else {
+        // Only the traced path can populate RequestHeader.additionalHeader, so
+        // it is used exactly when there is something to put there — an
+        // untraced `read` keeps going through the high-level service call.
+        std::string encoded_header;
+        result = client.ReadTraced(args.positionals[1],
+                                   GetOption(args, "attribute", "Value"), trace,
+                                   &encoded_header);
+        if (args.options.count("dump-header") > 0) {
+          // stderr, because stdout carries only command output. What is dumped
+          // is the additionalHeader ExtensionObject exactly as it went out,
+          // envelope included, so it can be diffed against a capture or
+          // against another implementation's encoding of the same ids.
+          std::cerr << "additionalHeader: " << encoded_header << "\n";
+        }
+      }
       if (args.json) {
         std::cout << boost::json::serialize(ReadToJson(result)) << "\n";
       } else {

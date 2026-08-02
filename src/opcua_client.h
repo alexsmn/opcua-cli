@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "nodeset.h"
+#include "span_context.h"
 
 struct SecurityOptions {
   std::string policy = "None";
@@ -153,6 +154,25 @@ class OpcuaClient {
 
   BrowseResult Browse(const std::string& target, bool recursive, int depth);
   ReadResult Read(const std::string& node_id, const std::string& attribute);
+
+  // Reads one attribute through a hand-built raw Read request, so that
+  // RequestHeader.additionalHeader can carry `trace`. The ordinary Read path
+  // cannot do this at all: the high-level service call owns the request header
+  // and exposes no extension slot.
+  //
+  // The point is interoperability, not diagnostics-as-usual — this sends an
+  // OPC UA Part 26 §5.6.4 SpanContext encoded here from the specification, so
+  // a server accepting it is evidence about the *server*, not about a shared
+  // library both ends happen to use.
+  //
+  // When `encoded_header_hex` is non-null it receives the exact octets of the
+  // additionalHeader ExtensionObject, envelope included, so what was sent can
+  // be compared against a capture or against a peer's own encoding.
+  ReadResult ReadTraced(const std::string& node_id,
+                        const std::string& attribute,
+                        const TraceContext& trace,
+                        std::string* encoded_header_hex);
+
   WriteResult Write(const std::string& node_id,
                     const std::string& value,
                     const std::string& type);

@@ -787,22 +787,22 @@ BrowseResult OpcuaClient::Browse(const std::string& target,
   return result;
 }
 
-ReadResult OpcuaClient::Read(const std::string& node_id_text,
-                             const std::string& attribute) {
-  const opcua::NodeId node_id = ParseNodeId(node_id_text);
-  const opcua::AttributeId attribute_id = AttributeId(attribute);
-  auto data_value = opcua::services::readAttribute(
-      *impl_->client, node_id, attribute_id, opcua::TimestampsToReturn::Both);
-
+// Renders one DataValue into a ReadResult. Shared by the high-level Read and
+// the low-level ReadTraced so the two cannot drift in how they report a value:
+// the traced path exists to prove a header travels, and it is only evidence of
+// that if its ordinary output is identical.
+ReadResult RenderRead(opcua::Client& client,
+                      const std::string& node_id_text,
+                      const opcua::NodeId& node_id,
+                      const std::string& attribute,
+                      const opcua::DataValue& value,
+                      opcua::StatusCode service_status) {
   ReadResult result;
   result.node_id = node_id_text;
   result.attribute = attribute;
-  result.status = StatusToString(data_value.code());
-  opcua::StatusCode status = data_value.code();
-  if (data_value) {
-    const opcua::DataValue& value = data_value.value();
+  opcua::StatusCode status = service_status;
+  if (!service_status.isBad()) {
     status = value.status();
-    result.status = StatusToString(status);
     if (value.hasValue()) {
       result.value = VariantToString(value.value());
       result.elements = VariantToElements(value.value());
@@ -816,9 +816,86 @@ ReadResult OpcuaClient::Read(const std::string& node_id_text,
       result.server_timestamp = DateTimeToString(value.serverTimestamp());
     }
   }
+  result.status = StatusToString(status);
   if (status == UA_STATUSCODE_BADATTRIBUTEIDINVALID) {
-    result.hint = ExplainAttributeIdInvalid(*impl_->client, node_id, attribute);
+    result.hint = ExplainAttributeIdInvalid(client, node_id, attribute);
   }
+  return result;
+}
+
+ReadResult OpcuaClient::Read(const std::string& node_id_text,
+                             const std::string& attribute) {
+  const opcua::NodeId node_id = ParseNodeId(node_id_text);
+  const opcua::AttributeId attribute_id = AttributeId(attribute);
+  auto data_value = opcua::services::readAttribute(
+      *impl_->client, node_id, attribute_id, opcua::TimestampsToReturn::Both);
+
+  if (!data_value) {
+    return RenderRead(*impl_->client, node_id_text, node_id, attribute,
+                      opcua::DataValue{}, data_value.code());
+  }
+  return RenderRead(*impl_->client, node_id_text, node_id, attribute,
+                    data_value.value(), opcua::StatusCode{UA_STATUSCODE_GOOD});
+}
+
+ReadResult OpcuaClient::ReadTraced(const std::string& node_id_text,
+                                   const std::string& attribute,
+                                   const TraceContext& trace,
+                                   std::string* encoded_header_hex) {
+  const opcua::NodeId node_id = ParseNodeId(node_id_text);
+  const EncodedAdditionalHeader header = EncodeAdditionalHeader(trace);
+  if (encoded_header_hex != nullptr) {
+    *encoded_header_hex = ToHex(header.full);
+  }
+
+  UA_ReadValueId node_to_read;
+  UA_ReadValueId_init(&node_to_read);
+  // Borrowed, not copied — and that is why the request is never cleared.
+  // UA_ReadRequest_clear would walk into `node_id`'s storage and into the
+  // ByteString below, neither of which this request owns.
+  node_to_read.nodeId = *node_id.handle();
+  node_to_read.attributeId = static_cast<UA_UInt32>(AttributeId(attribute));
+
+  UA_ReadRequest request;
+  UA_ReadRequest_init(&request);
+  request.nodesToRead = &node_to_read;
+  request.nodesToReadSize = 1;
+  request.timestampsToReturn = UA_TIMESTAMPSTORETURN_BOTH;
+  // The whole reason this low-level path exists: opcua::services::readAttribute
+  // builds the RequestHeader itself and exposes no extension slot. Here the
+  // slot is ours; the stack fills in authenticationToken, timestamp,
+  // requestHandle and timeoutHint on the way out and leaves it alone.
+  UA_ExtensionObject& additional_header =
+      request.requestHeader.additionalHeader;
+  additional_header.encoding = UA_EXTENSIONOBJECT_ENCODED_BYTESTRING;
+  additional_header.content.encoded.typeId =
+      UA_NODEID_NUMERIC(0, kAdditionalParametersEncodingId);
+  additional_header.content.encoded.body.data =
+      const_cast<UA_Byte*>(header.body.data());
+  additional_header.content.encoded.body.length = header.body.size();
+
+  UA_ReadResponse response =
+      UA_Client_Service_read(impl_->client->handle(), request);
+
+  const opcua::StatusCode service_status =
+      response.responseHeader.serviceResult;
+  ReadResult result;
+  if (!service_status.isBad() && response.resultsSize == 1) {
+    result = RenderRead(*impl_->client, node_id_text, node_id, attribute,
+                        opcua::asWrapper<opcua::DataValue>(response.results[0]),
+                        opcua::StatusCode{UA_STATUSCODE_GOOD});
+  } else {
+    // A Bad serviceResult is the answer that matters here. A server that
+    // rejected the header outright fails the whole service call rather than
+    // any one node, so this must stay visible instead of rendering as a node
+    // with no value.
+    result = RenderRead(
+        *impl_->client, node_id_text, node_id, attribute, opcua::DataValue{},
+        service_status.isBad()
+            ? service_status
+            : opcua::StatusCode{UA_STATUSCODE_BADUNEXPECTEDERROR});
+  }
+  UA_ReadResponse_clear(&response);
   return result;
 }
 

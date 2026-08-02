@@ -25,9 +25,32 @@ and do not assume anything in this repo is shared with it.
 | `src/cli.cpp` | Argument parsing, command dispatch, all human and `--json` output formatting. |
 | `src/opcua_client.{h,cpp}` | The `open62541pp` client wrapper: connect, browse, read, write, endpoints, address-space crawl. All OPC UA value rendering lives here. |
 | `src/nodeset.{h,cpp}` | UANodeSet XML reading (`generate:nodeset`) and writing (`dump:nodeset`). |
+| `src/span_context.{h,cpp}` | Hand-rolled OPC UA Part 26 §5.6.4 `SpanContext` encoder for `read`'s trace-context flags. Deliberately dependency-free — see below. |
 
 The whole tool is one executable target; there is no library split and no test
 suite yet.
+
+### The Part 26 encoder is meant to be hand-written
+
+`src/span_context.cpp` encodes `SpanContextDataType` byte by byte from the
+OPC UA Part 6 rules, and that is not an oversight to tidy up. open62541 ships no
+Part 26 DataTypes, so there is nothing to call — but more importantly the point
+of the code is to be an **independent** implementation. It exists so that a
+SCADA server accepting the header proves something about the server rather than
+about a library both ends share. Replacing it with a generated or borrowed
+encoder would destroy exactly the property it was written for.
+
+Two things it must keep doing:
+
+- **Send meaningless values on request.** A null TraceId and a zero SpanId are
+  the inputs a server's handling most needs testing on, so `--span-context`
+  accepts them rather than validating them away.
+- **Read the trace id as canonical Guid *text*, not raw bytes.** Part 3 §8.14
+  and Part 6 §5.2.2.6 make a Guid four little-endian fields, so the two
+  readings differ by a transposition of the leading eight bytes — and a server
+  accepts either with a Good status. Part 26 v1.05.07 does not say which is
+  intended. This tool's answer matches the SCADA tree's ADR 0008; if that ever
+  changes, both move together or the two silently stop correlating.
 
 ## Build
 

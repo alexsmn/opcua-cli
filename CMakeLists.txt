@@ -13,6 +13,7 @@ add_executable(opcua-cli
   src/cli.cpp
   src/nodeset.cpp
   src/opcua_client.cpp
+  src/span_context.cpp
 )
 
 target_include_directories(opcua-cli PRIVATE src)

@@ -43,12 +43,53 @@ The workflow publishes a GitHub Release with packaged `opcua-cli` binaries.
 ```sh
 opcua-cli browse opc.tcp://localhost:4840 [/Objects|NODEID] [--recursive] [--depth=N] [--json]
 opcua-cli read opc.tcp://localhost:4840 NODEID [--attribute=Value] [--json]
+                                          [--span-context=TRACEID:SPANID] [--traceparent=VALUE] [--dump-header]
 opcua-cli write opc.tcp://localhost:4840 NODEID VALUE [--type=Int32] [--json]
 opcua-cli endpoints opc.tcp://localhost:4840 [--json]
 opcua-cli watch opc.tcp://localhost:4840 NODEID [--interval=250] [--duration=SECONDS] [--count=N] [--json]
 opcua-cli events opc.tcp://localhost:4840 [NODEID] [--duration=SECONDS] [--count=N] [--select=FIELD,...] [--json]
 opcua-cli generate:nodeset path/to/NodeSet2.xml [--output=generated] [--namespace=Generated::OpcUa]
 opcua-cli dump:nodeset opc.tcp://localhost:4840 --output=Server.NodeSet2.xml [--namespace=N] [--root=NODEID] [--max-nodes=N] [--values]
+```
+
+`read`'s trace-context flags attach an **OPC UA Part 26 §5.6.4** span context
+to the request, in `RequestHeader.additionalHeader`. They exist to test what a
+server does with one: open62541 ships no Part 26 DataTypes, so `SpanContextDataType`
+is encoded here by hand from the Part 6 rules, and a server that reads it back
+correctly has been shown to interoperate with an implementation that shares no
+code with it. Passing any of them switches `read` from the high-level service
+call to a raw request, because only the raw path can reach the header at all.
+
+- `--span-context=TRACEID:SPANID` — the Part 26 entry. `TRACEID` is 32 hex
+  digits (dashes optional) read as the Guid's **canonical 8-4-4-4-12 text
+  form**, `SPANID` is 16 hex digits read as a big-endian `UInt64`. Either side
+  may be left empty to send the all-zero value for it.
+- `--traceparent=VALUE` — the W3C entry, sent verbatim. Legal alongside the
+  Part 26 entry: [Part 4 §7.33](https://reference.opcfoundation.org/Core/Part4/v105/docs/7.33)
+  makes the slot a list, and a peer must ignore keys it does not understand.
+- `--dump-header` — print the encoded `additionalHeader` ExtensionObject as
+  hex on **stderr**, envelope included, so what went out can be diffed against
+  a capture or another implementation's encoding.
+
+The Guid mapping is the part worth being careful about, and the reason the flag
+takes text rather than bytes. An OPC UA Guid is **not** an opaque 16-byte array:
+[Part 3 §8.14](https://reference.opcfoundation.org/Core/Part3/v105/docs/8.14)
+gives it four fields and
+[Part 6 §5.2.2.6](https://reference.opcfoundation.org/Core/Part6/v105/docs/5.2.2.6)
+writes the first three little endian. Reading the same 32 hex digits as raw
+bytes transposes the leading eight — and a server accepts that happily, with a
+Good status, correlating the request against the wrong trace. Part 26 v1.05.07
+does not specify which reading is intended, so the two ends have to agree out
+of band.
+
+```sh
+# a known span context, with the bytes printed
+opcua-cli read opc.tcp://localhost:4840 i=2255 \
+  --span-context=4bf92f35-77b3-4da6-a3ce-929d0e0e4736:00f067aa0ba902b7 --dump-header
+# both keys at once
+opcua-cli read opc.tcp://localhost:4840 i=2255 \
+  --span-context=4bf92f35-77b3-4da6-a3ce-929d0e0e4736:00f067aa0ba902b7 \
+  --traceparent=00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
 ```
 
 `watch` polls a node's Value and prints one sample per line, flushing each
